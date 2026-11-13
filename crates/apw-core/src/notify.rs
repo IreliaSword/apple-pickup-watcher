@@ -1,7 +1,7 @@
 //! 到货提醒的发送渠道。
 //!
-//! 这里只做「把一条通知送出去」这一件事：[`Bark`] 远程推送、[`Sound`] 本地
-//! 提示音，以及把若干渠道并发组合起来的 [`Multi`]。
+//! 这里只做「把一条通知送出去」这一件事：[`Bark`]、[`Feishu`]、[`Discord`]
+//! 远程推送、[`Sound`] 本地提示音，以及把若干渠道并发组合起来的 [`Multi`]。
 //!
 //! 刻意**不**包含系统桌面通知：那需要界面框架的句柄，放进来会让整个 crate
 //! 无法脱离 GUI 单独测试，也会把 UI 依赖传染给调度层。
@@ -15,7 +15,7 @@
 //!
 //! # 未配置不是错误
 //!
-//! 用户没填 Bark 地址、这份构建里没有内嵌音频，都属于「这个渠道没开」，
+//! 用户没填推送地址、这份构建里没有内嵌音频，都属于「这个渠道没开」，
 //! `notify` 直接返回 `Ok(())`。只有「开了但没成功」才是错误 —— 否则界面上
 //! 会一直挂着一条用户根本没打算开的功能的报错。
 
@@ -313,7 +313,7 @@ async fn read_capped(
 /// 把 reqwest 的错误写成给人看的一句话，**不带请求地址**。
 ///
 /// reqwest 的错误文本自带完整 URL（`error sending request for url (…)`），而 Bark
-/// 的设备 key、飞书机器人的密钥都在路径里。这句话会原样进日志，用户排查问题时
+/// 的设备 key、飞书与 Discord 的 webhook token 都在路径里。这句话会原样进日志，用户排查问题时
 /// 常把日志贴进公开的 issue，等于把推送权限交了出去。
 ///
 /// 去掉地址之后，把错误链上的原因接在后面。原来那句只说「发请求出错」，连不上、
@@ -337,7 +337,7 @@ fn describe_http_error(err: reqwest::Error) -> String {
 }
 
 /// 出错提示里复述用户填的地址时只留协议和主机，路径换成省略号：Bark 的设备
-/// key、飞书机器人的密钥都在路径里。
+/// key、飞书与 Discord 的 webhook token 都在路径里。
 fn redacted(u: &Url) -> String {
     match u.host_str().filter(|host| !host.is_empty()) {
         Some(host) => format!("{}://{host}/…", u.scheme()),
@@ -679,6 +679,150 @@ fn feishu_business_error(body: &[u8]) -> Option<(i64, String)> {
     let payload: Payload = serde_json::from_slice(body).ok()?;
     let code = payload.code.or(payload.status_code)?;
     (code != 0).then(|| (code, payload.msg.unwrap_or_default()))
+}
+
+// ---------------------------------------------------------------------------
+// Discord 频道 Webhook
+// ---------------------------------------------------------------------------
+
+const DISCORD: &str = "Discord";
+const DISCORD_TIMEOUT: Duration = Duration::from_secs(10);
+const DISCORD_HOOK_PATH: &str = "/api/webhooks/";
+
+/// 通过 Discord 频道 webhook 发送到货提醒。
+///
+/// webhook 可在服务器设置 → 连携服务（Integrations）→ Webhooks 中创建。Discord
+/// 成功时通常返回 `204 No Content`；所有 2xx 状态都视为成功。
+#[derive(Debug, Clone)]
+pub struct Discord {
+    webhook: String,
+    http: reqwest::Client,
+    timeout: Duration,
+    name: String,
+}
+
+impl Discord {
+    pub fn new(webhook: String, http: reqwest::Client) -> Self {
+        Self {
+            webhook: webhook.trim().to_string(),
+            http,
+            timeout: DISCORD_TIMEOUT,
+            name: DISCORD.to_string(),
+        }
+    }
+
+    /// 分号 / 换行分隔，一个地址一个；多个时给渠道名加序号。
+    pub fn from_list(raw: &str, http: reqwest::Client) -> Vec<Self> {
+        let urls = split_bark_urls(raw);
+        let many = urls.len() > 1;
+        urls.into_iter()
+            .enumerate()
+            .map(|(i, url)| {
+                let mut discord = Self::new(url, http.clone());
+                if many {
+                    discord.name = format!("{DISCORD} #{}", i + 1);
+                }
+                discord
+            })
+            .collect()
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn is_configured(&self) -> bool {
+        !self.webhook.is_empty()
+    }
+}
+
+impl Notifier for Discord {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn notify(&self, n: &Notification) -> Result<(), NotifyError> {
+        if !self.is_configured() {
+            return Ok(());
+        }
+        let url = validate_discord_webhook(&self.webhook)?;
+        let content = discord_text(n);
+        if content.is_empty() {
+            return Err(discord_config_err("标题、正文和链接不能全为空".to_string()));
+        }
+
+        let mut resp = self
+            .http
+            .post(url)
+            .timeout(self.timeout)
+            .json(&serde_json::json!({
+                "content": content,
+                // 库存名称由外部目录提供，禁止它意外触发 @everyone / 用户提及。
+                "allowed_mentions": { "parse": [] },
+            }))
+            .send()
+            .await
+            .map_err(|e| NotifyError::Transport {
+                channel: self.name.clone(),
+                detail: describe_http_error(e),
+            })?;
+
+        let status = resp.status();
+        let body = read_capped(&mut resp, BARK_MAX_BODY, &self.name).await?;
+        if !status.is_success() {
+            return Err(NotifyError::Rejected {
+                channel: self.name.clone(),
+                status: status.as_u16(),
+                body: summarize(&body),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_discord_webhook(webhook: &str) -> Result<Url, NotifyError> {
+    let u = Url::parse(webhook).map_err(|e| discord_config_err(format!("地址无法解析：{e}")))?;
+    if !matches!(u.scheme(), "http" | "https") || u.host_str().unwrap_or_default().is_empty() {
+        return Err(discord_config_err(format!(
+            "地址必须是以 http:// 或 https:// 开头的完整地址，当前为 {}",
+            redacted(&u)
+        )));
+    }
+    let Some(rest) = u.path().strip_prefix(DISCORD_HOOK_PATH) else {
+        return Err(discord_config_err(
+            "地址路径应形如 /api/webhooks/<webhook id>/<token>".to_string(),
+        ));
+    };
+    let mut parts = rest.split('/').filter(|part| !part.is_empty());
+    if parts.next().is_none() || parts.next().is_none() {
+        return Err(discord_config_err(
+            "地址缺少 webhook id 或 token，应从 Discord 的 Webhooks 页面完整复制".to_string(),
+        ));
+    }
+    Ok(u)
+}
+
+fn discord_config_err(detail: String) -> NotifyError {
+    NotifyError::Config {
+        channel: DISCORD.to_string(),
+        detail,
+    }
+}
+
+/// Discord 普通消息上限为 2000 个字符。通知通常远短于此；仍在这里截断，避免
+/// 极端的商品标题让整条到货提醒被 Discord 用 400 拒绝。
+fn discord_text(n: &Notification) -> String {
+    let mut lines = Vec::new();
+    for text in [n.title.trim(), n.body.trim()] {
+        if !text.is_empty() {
+            lines.push(text.to_string());
+        }
+    }
+    if let Some(url) = n.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        lines.push(url.to_string());
+    }
+    lines.join("\n").chars().take(2000).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,6 +1458,42 @@ mod tests {
         assert_eq!(feishu_text(&n("  ", "只有正文")), "只有正文");
         // 标题正文都空的极端情况：拼出空文本，由服务端的关键词校验兜底报错。
         assert_eq!(feishu_text(&n(" ", "")), "");
+    }
+
+    #[test]
+    fn discord_webhook地址必须包含id和token() {
+        for bad in [
+            "",
+            "不是地址",
+            "ftp://discord.com/api/webhooks/123/token",
+            "https://discord.com/api/webhooks/123",
+            "https://discord.com/not-a-webhook/123/token",
+        ] {
+            let err = validate_discord_webhook(bad)
+                .err()
+                .unwrap_or_else(|| panic!("{bad:?} 不该被接受"));
+            assert_eq!(err.channel(), Some("Discord"));
+            assert!(matches!(err, NotifyError::Config { .. }), "{bad:?}");
+        }
+        let url = validate_discord_webhook(
+            "https://discord.com/api/webhooks/123/secret-token?wait=false",
+        )
+        .expect("完整 Discord webhook 应当通过");
+        assert_eq!(url.path(), "/api/webhooks/123/secret-token");
+    }
+
+    #[test]
+    fn discord文本包含标题正文和链接且限制长度() {
+        let notification =
+            n("有货了", "上海-环球港 iPhone 17").with_url("https://www.apple.com.cn/shop/bag");
+        assert_eq!(
+            discord_text(&notification),
+            "有货了
+上海-环球港 iPhone 17
+https://www.apple.com.cn/shop/bag"
+        );
+        let long = Notification::new("x".repeat(2500), "");
+        assert_eq!(discord_text(&long).chars().count(), 2000);
     }
 
     #[test]

@@ -69,8 +69,10 @@ const DEFAULT_SETTINGS: Settings = {
   locale: "zh_CN",
   targets: [],
   intervalSeconds: 30,
+  intervalMaxSeconds: 30,
   barkUrl: "",
   feishuWebhook: "",
+  discordWebhook: "",
   soundEnabled: true,
   openBagOnHit: true,
   proxies: [],
@@ -303,10 +305,10 @@ export async function stopWatching(): Promise<void> {
   await invoke("stop_watching");
 }
 
-export async function setIntervalSeconds(seconds: number): Promise<void> {
+export async function setIntervalRange(minSeconds: number, maxSeconds: number): Promise<void> {
   try {
-    const applied = await invoke<number>("set_interval", { seconds });
-    update({ settings: { ...state.settings, intervalSeconds: applied } });
+    const saved = await invoke<Settings>("set_interval_range", { minSeconds, maxSeconds });
+    update({ settings: saved });
   } catch (err) {
     pushLog(`设置查询间隔失败：${String(err)}`);
   }

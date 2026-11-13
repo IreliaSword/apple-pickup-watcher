@@ -133,6 +133,7 @@ impl Default for WatcherConfig {
 enum Command {
     SetTargets(Vec<Target>),
     SetInterval(Duration),
+    SetIntervalRange(Duration, Duration),
     Start(oneshot::Sender<()>),
     Stop(oneshot::Sender<()>),
     Snapshot(oneshot::Sender<Vec<TargetState>>),
@@ -186,6 +187,12 @@ impl Watcher {
     /// 调整查询间隔，下一轮等待时生效。
     pub async fn set_interval(&self, interval: Duration) {
         let _ = self.cmd.send(Command::SetInterval(interval)).await;
+    }
+
+    /// 设置显式的随机查询间隔范围（含两端）。每轮结束后重新抽取一次。
+    /// 上限小于下限时按固定的下限处理。
+    pub async fn set_interval_range(&self, min: Duration, max: Duration) {
+        let _ = self.cmd.send(Command::SetIntervalRange(min, max)).await;
     }
 
     /// 启动监控。返回时引擎已经进入运行态。
@@ -616,6 +623,9 @@ fn now_ms() -> u64 {
 struct Engine<F: Fetcher> {
     client: F,
     config: WatcherConfig,
+    /// 桌面端设置的显式随机范围。`None` 时沿用 `WatcherConfig::jitter`，
+    /// 让 CLI 与现有嵌入方保持原行为。
+    interval_range: Option<(Duration, Duration)>,
     events: mpsc::Sender<Event>,
     /// 最多缓存一轮的关键事件，投递完才查下一轮；启停事件合并为最新状态。
     pending_events: VecDeque<Event>,
@@ -640,6 +650,7 @@ impl<F: Fetcher> Engine<F> {
         Self {
             client,
             config,
+            interval_range: None,
             events,
             pending_events: VecDeque::new(),
             rearmed: BTreeSet::new(),
@@ -754,6 +765,13 @@ impl<F: Fetcher> Engine<F> {
             Command::SetInterval(d) => {
                 if d > Duration::ZERO {
                     self.config.interval = d;
+                    self.interval_range = None;
+                }
+            }
+            Command::SetIntervalRange(min, max) => {
+                if min > Duration::ZERO {
+                    self.config.interval = min;
+                    self.interval_range = Some((min, max.max(min)));
                 }
             }
             Command::Start(reply) => {
@@ -1063,21 +1081,28 @@ impl<F: Fetcher> Engine<F> {
 
     /// 下一轮的等待时长，含抖动与全局退避。
     fn next_delay(&self) -> Duration {
-        let mut base = self.config.interval;
+        let mut base = if let Some((min, max)) = self.interval_range {
+            if min == max {
+                min
+            } else {
+                let secs = rand::rng().random_range(min.as_secs_f64()..=max.as_secs_f64());
+                Duration::from_secs_f64(secs)
+            }
+        } else if self.config.jitter > 0.0 {
+            let delta = rand::rng().random_range(-self.config.jitter..=self.config.jitter);
+            let secs = self.config.interval.as_secs_f64() * (1.0 + delta);
+            Duration::from_secs_f64(secs.max(1.0))
+        } else {
+            self.config.interval
+        };
 
-        // 整轮全败时逐步拉长间隔，最多放大到 8 倍。被拦截还按原频率猛冲，
-        // 只会让风控更严。
+        // 整轮全败时逐步拉长已经抽到的间隔，最多放大到 8 倍。被拦截还按原
+        // 频率猛冲，只会让风控更严。
         if self.cycle_failures > 0 {
             let factor = 1u32 << self.cycle_failures.min(3);
             base = base.saturating_mul(factor);
         }
-
-        if self.config.jitter <= 0.0 {
-            return base;
-        }
-        let delta = rand::rng().random_range(-self.config.jitter..=self.config.jitter);
-        let secs = base.as_secs_f64() * (1.0 + delta);
-        Duration::from_secs_f64(secs.max(1.0))
+        base
     }
 
     /// 投递可以丢弃的事件。

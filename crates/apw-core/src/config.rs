@@ -132,19 +132,24 @@ pub struct Settings {
     pub locale: String,
     /// 监控目标列表。
     pub targets: Vec<Target>,
-    /// 每轮查询之间的间隔秒数。
+    /// 每轮查询之间的最短间隔秒数。
     pub interval_seconds: u64,
+    /// 每轮查询之间的最长间隔秒数。每轮会在最短与最长值之间重新随机；
+    /// 与最短值相同表示使用固定间隔。
+    pub interval_max_seconds: u64,
     /// Bark 推送地址，为空表示不启用。多个地址在文件里用分号连成一个字符串，
     /// 见 [`Settings::bark_urls`]；字段仍是一个字符串，旧配置原样可读。
     ///
-    /// 界面上 Bark 和飞书是同一个「推送地址」列表，用户不用自己选渠道：
+    /// 界面上 Bark、飞书和 Discord 是同一个「推送地址」列表，用户不用自己选渠道：
     /// 读写都走 [`Settings::push_urls`] / [`Settings::set_push_urls`]，
-    /// 每个地址归哪个渠道由 [`push_kind`] 按长相判断，这两个字段只是存法。
+    /// 每个地址归哪个渠道由 [`push_kind`] 按长相判断，这些字段只是存法。
     pub bark_url: String,
     /// 飞书群自定义机器人的 webhook 地址，为空表示不启用；存法同
     /// [`Settings::bark_url`]。创建机器人时安全设置选「自定义关键词」并填
     /// 「有货」即可，提醒标题「有货了」天然命中。
     pub feishu_webhook: String,
+    /// Discord 频道 webhook 地址，为空表示不启用；存法同 [`Settings::bark_url`]。
+    pub discord_webhook: String,
     /// 有货时是否播放提示音。
     pub sound_enabled: bool,
     /// 有货时是否自动打开购物袋页面。
@@ -168,8 +173,10 @@ impl Default for Settings {
             locale: fallback_locale().to_string(),
             targets: Vec::new(),
             interval_seconds: DEFAULT_INTERVAL_SECONDS,
+            interval_max_seconds: DEFAULT_INTERVAL_SECONDS,
             bark_url: String::new(),
             feishu_webhook: String::new(),
+            discord_webhook: String::new(),
             sound_enabled: true,
             open_bag_on_hit: true,
             proxies: Vec::new(),
@@ -192,6 +199,11 @@ impl Settings {
         // 想要的是快，但 5 秒同样会被风控盯上；退回 30 秒才是安全的那一侧。
         if self.interval_seconds < MIN_INTERVAL_SECONDS {
             self.interval_seconds = DEFAULT_INTERVAL_SECONDS;
+        }
+        // 老配置没有最长间隔字段时会先拿默认值；若它比最短间隔小，就收敛成
+        // 固定间隔，既保留旧版用户的数值，也避免生成一个反向区间。
+        if self.interval_max_seconds < self.interval_seconds {
+            self.interval_max_seconds = self.interval_seconds;
         }
 
         // 推送地址收敛成「分号分隔、无空项、无重复」的规范写法，读回来和
@@ -234,9 +246,12 @@ impl Settings {
         self.proxies = normalize_proxies(&self.proxies);
     }
 
-    /// 查询间隔。
-    pub fn interval(&self) -> Duration {
-        Duration::from_secs(self.interval_seconds)
+    /// 查询间隔范围（含两端）。每轮由调度器在范围内重新随机。
+    pub fn interval_range(&self) -> (Duration, Duration) {
+        (
+            Duration::from_secs(self.interval_seconds),
+            Duration::from_secs(self.interval_max_seconds),
+        )
     }
 
     /// 配置的全部 Bark 推送地址，空表示未启用。
@@ -244,32 +259,37 @@ impl Settings {
         split_bark_urls(&self.bark_url)
     }
 
-    /// 全部推送地址：Bark 在前、飞书在后，各自保持填写顺序，去掉重复。
+    /// 全部推送地址：Bark、飞书、Discord 依次排列，各自保持填写顺序，去掉重复。
     pub fn push_urls(&self) -> Vec<String> {
         let mut all = split_bark_urls(&self.bark_url);
-        for url in split_bark_urls(&self.feishu_webhook) {
-            if !all.contains(&url) {
-                all.push(url);
+        for raw in [&self.feishu_webhook, &self.discord_webhook] {
+            for url in split_bark_urls(raw) {
+                if !all.contains(&url) {
+                    all.push(url);
+                }
             }
         }
         all
     }
 
-    /// 用一组推送地址整体替换现有的，逐个按 [`push_kind`] 归到 Bark 或飞书。
+    /// 用一组推送地址整体替换现有的，逐个按 [`push_kind`] 归到 Bark、飞书或 Discord。
     ///
     /// 每一项还会再按分号、换行和空白拆开：用户把老版本里分号连着的一整串
     /// 粘进一行，也能拆成几个地址各归各的渠道。
     pub fn set_push_urls(&mut self, urls: &[String]) {
         let mut bark: Vec<String> = Vec::new();
         let mut feishu: Vec<String> = Vec::new();
+        let mut discord: Vec<String> = Vec::new();
         for url in split_bark_urls(&urls.join("\n")) {
             match push_kind(&url) {
                 PushKind::Bark => bark.push(url),
                 PushKind::Feishu => feishu.push(url),
+                PushKind::Discord => discord.push(url),
             }
         }
         self.bark_url = bark.join(";");
         self.feishu_webhook = feishu.join(";");
+        self.discord_webhook = discord.join(";");
     }
 }
 
@@ -278,14 +298,17 @@ impl Settings {
 pub enum PushKind {
     Bark,
     Feishu,
+    Discord,
 }
 
 /// 飞书（含 Lark 国际版）群机器人 webhook 固定的路径前缀。
 const FEISHU_HOOK_PATH: &str = "/open-apis/bot/v2/hook/";
+/// Discord 频道 webhook 的固定路径前缀。
+const DISCORD_HOOK_PATH: &str = "/api/webhooks/";
 
 /// 按地址长相判断推送渠道。
 ///
-/// 飞书群机器人的 webhook 路径是固定的，认得出来；其余一律当 Bark。自建的 Bark
+/// 飞书与 Discord 的 webhook 路径固定，认得出来；其余一律当 Bark。自建的 Bark
 /// 服务器主机名五花八门，没法逐个认，只能兜底。判断放在 Rust 这一侧、界面不另
 /// 抄一份：抄一份，迟早会有一边先认了新渠道、另一边还按老规矩归类。
 pub fn push_kind(url: &str) -> PushKind {
@@ -296,13 +319,20 @@ pub fn push_kind(url: &str) -> PushKind {
         Err(_) => url.contains(FEISHU_HOOK_PATH),
     };
     if feishu {
-        PushKind::Feishu
+        return PushKind::Feishu;
+    }
+    let discord = match reqwest::Url::parse(url) {
+        Ok(parsed) => parsed.path().starts_with(DISCORD_HOOK_PATH),
+        Err(_) => url.contains(DISCORD_HOOK_PATH),
+    };
+    if discord {
+        PushKind::Discord
     } else {
         PushKind::Bark
     }
 }
 
-/// 把设置里的推送地址拆成一条条：分号、换行、空白都算分隔符。Bark 和飞书共用，
+/// 把设置里的推送地址拆成一条条：分号、换行、空白都算分隔符。Bark、飞书和 Discord 共用，
 /// 名字是只有 Bark 时起的。
 ///
 /// 文件里多个地址用分号连成一个字符串（issue #35 起就是这个存法）。放在这里而不是 `notify` 模块，是因为后者挂在 `notifications` feature 后面，
@@ -677,9 +707,16 @@ impl LegacySettings {
                 .interval_seconds
                 .and_then(|v| u64::try_from(v).ok())
                 .unwrap_or(fallback.interval_seconds),
+            // Go 版只有一个固定间隔；迁移后最短、最长保持相同。normalize 会在
+            // 非法旧值回退后把反向区间收敛。
+            interval_max_seconds: self
+                .interval_seconds
+                .and_then(|v| u64::try_from(v).ok())
+                .unwrap_or(fallback.interval_max_seconds),
             bark_url: self.bark_url.unwrap_or(fallback.bark_url),
             // Go 版没有飞书推送，迁移过来的文件一律从空开始。
             feishu_webhook: String::new(),
+            discord_webhook: String::new(),
             sound_enabled: self.sound_enabled.unwrap_or(fallback.sound_enabled),
             open_bag_on_hit: self.open_bag_on_hit.unwrap_or(fallback.open_bag_on_hit),
             // Go 版没有代理设置，迁移过来的文件一律从空开始。
@@ -715,6 +752,7 @@ mod tests {
         // 存取往返会莫名其妙地改内容。
         assert_eq!(before, s);
         assert_eq!(s.interval_seconds, DEFAULT_INTERVAL_SECONDS);
+        assert_eq!(s.interval_max_seconds, DEFAULT_INTERVAL_SECONDS);
         assert!(s.sound_enabled);
         assert!(s.open_bag_on_hit);
         assert!(region_by_locale(&s.locale).is_some());
@@ -759,7 +797,13 @@ mod tests {
         };
         s.normalize();
         assert_eq!(s.interval_seconds, MIN_INTERVAL_SECONDS);
-        assert_eq!(s.interval(), Duration::from_secs(MIN_INTERVAL_SECONDS));
+        assert_eq!(
+            s.interval_range(),
+            (
+                Duration::from_secs(MIN_INTERVAL_SECONDS),
+                Duration::from_secs(DEFAULT_INTERVAL_SECONDS),
+            )
+        );
     }
 
     #[test]

@@ -30,14 +30,23 @@ function renderApp() {
       saveSettings: async (settings) => { saved.push(settings); state.settings = settings; },
       setTargets: async (targets) => { addedTargets.push(targets); },
       setCategory: (category) => { state.category = category; },
+      setIntervalRange: async (minSeconds, maxSeconds) => {
+        state.settings = { ...state.settings, intervalSeconds: minSeconds, intervalMaxSeconds: maxSeconds };
+      },
       changeLocale: async (locale) => { state.settings = { ...state.settings, locale }; },
       setPushUrls: async (urls) => {
         pushSaves.push(urls);
         // 模拟后端分栏存放。真正的归类规则在 Rust 侧，由 crates/apw-core/tests/config.rs 覆盖；
         // 这里只需要让界面拿到「哪个地址存在哪一栏」。
         const feishu = urls.filter((url) => url.includes("/open-apis/bot/v2/hook/"));
-        const bark = urls.filter((url) => !feishu.includes(url));
-        state.settings = { ...state.settings, barkUrl: bark.join(";"), feishuWebhook: feishu.join(";") };
+        const discord = urls.filter((url) => url.includes("/api/webhooks/"));
+        const bark = urls.filter((url) => !feishu.includes(url) && !discord.includes(url));
+        state.settings = {
+          ...state.settings,
+          barkUrl: bark.join(";"),
+          feishuWebhook: feishu.join(";"),
+          discordWebhook: discord.join(";"),
+        };
       },
     };
     if (specifier.startsWith("@/components/") || specifier === "lucide-react") {
@@ -80,6 +89,9 @@ function renderApp() {
   const isAddPush = (element) => element.type === "Button" &&
     Array.isArray(element.props.children) && element.props.children.includes(" 添加推送地址");
   return {
+    intervalInput: (edge) => control((element) => element?.props?.id === `interval-${edge}`),
+    intervalGroup: () => control((element) => element?.type === "div" &&
+      typeof element.props?.onBlur === "function"),
     proxyRow: (index) => control((element) => element?.props?.id === `proxy-${index}`),
     proxyValues: () => all((element) => /^proxy-\d+$/.test(element?.props?.id ?? "")).map((element) => element.props.value),
     removeProxy: (index) => control((element) => element?.props?.["aria-label"] === `删除代理地址 ${index + 1}`),
@@ -111,8 +123,22 @@ function renderApp() {
 const K1 = "https://api.day.app/k1";
 const K2 = "https://api.day.app/k2";
 const F1 = "https://open.feishu.cn/open-apis/bot/v2/hook/f1";
+const D1 = "https://discord.com/api/webhooks/123/token";
 
-test("saved push addresses are one list, Bark first then Feishu, labelled by where the backend filed them", () => {
+test("query interval saves a minimum and maximum together", async () => {
+  const app = renderApp();
+  app.intervalInput("min").onChange({ target: { valueAsNumber: 60 } });
+  app.intervalInput("max").onChange({ target: { valueAsNumber: 90 } });
+  app.intervalGroup().onBlur({
+    currentTarget: { contains: () => false },
+    relatedTarget: null,
+  });
+  await new Promise(setImmediate);
+  assert.equal(app.state.settings.intervalSeconds, 60);
+  assert.equal(app.state.settings.intervalMaxSeconds, 90);
+});
+
+test("saved push addresses are one list ordered by channel and labelled by the backend", () => {
   const app = renderApp();
   assert.deepEqual(app.pushValues(), ["https://api.day.app/saved-key"]);
   // 没动过时跟着后端走。
@@ -121,6 +147,17 @@ test("saved push addresses are one list, Bark first then Feishu, labelled by whe
   assert.deepEqual(app.pushLabels(), ["Bark", "Bark", "飞书"]);
   // 最后一行有内容才给「添加」，界面上最多只有一个空行。
   assert.equal(app.hasAddPush(), true);
+});
+
+test("Discord webhooks are labelled and saved with the other push addresses", () => {
+  const app = renderApp();
+  app.state.settings = { ...app.state.settings, barkUrl: K1, feishuWebhook: F1, discordWebhook: D1 };
+  assert.deepEqual(app.pushValues(), [K1, F1, D1]);
+  assert.deepEqual(app.pushLabels(), ["Bark", "飞书", "Discord"]);
+
+  app.removePush(2).onClick();
+  assert.deepEqual(app.pushSaves.at(-1), [K1, F1]);
+  assert.equal(app.state.settings.discordWebhook, "");
 });
 
 test("old settings without push addresses show one empty row that saves on blur", () => {
