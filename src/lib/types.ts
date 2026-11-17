@@ -82,10 +82,15 @@ export interface Store {
 export interface Settings {
   locale: string;
   targets: Target[];
+  /** 每轮查询的最短等待秒数。 */
   intervalSeconds: number;
+  /** 每轮查询的最长等待秒数；与最短值相同表示固定间隔。 */
+  intervalMaxSeconds: number;
   barkUrl: string;
   /** 飞书群自定义机器人 webhook；为空表示不启用。多个用分号分隔。 */
   feishuWebhook: string;
+  /** Discord 频道 webhook；为空表示不启用。多个用分号分隔。 */
+  discordWebhook: string;
   soundEnabled: boolean;
   openBagOnHit: boolean;
   /** 代理地址列表；每个代理是一条额外的出口线路，被拦时切换。可为空。 */

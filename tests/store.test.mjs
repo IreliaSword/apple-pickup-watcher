@@ -160,3 +160,20 @@ test("a failed refresh still reloads the current catalog to expose partial backe
   assert.equal(app.snapshot().refreshing, false);
   assert.match(app.snapshot().logs.at(-1), /更新型号列表失败.*one page failed/);
 });
+
+test("interval range is sent together and replaced with the backend-normalized settings", async () => {
+  const app = setup();
+  app.handlers.set_interval_range = ({ minSeconds, maxSeconds }) => ({
+    ...app.snapshot().settings,
+    intervalSeconds: minSeconds,
+    intervalMaxSeconds: Math.max(minSeconds, maxSeconds),
+  });
+
+  await app.setIntervalRange(60, 90);
+  assert.deepEqual(app.calls.at(-1), {
+    command: "set_interval_range",
+    args: { minSeconds: 60, maxSeconds: 90 },
+  });
+  assert.equal(app.snapshot().settings.intervalSeconds, 60);
+  assert.equal(app.snapshot().settings.intervalMaxSeconds, 90);
+});

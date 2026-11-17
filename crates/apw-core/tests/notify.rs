@@ -6,13 +6,13 @@
 
 #![cfg(feature = "notifications")]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use apw_core::notify::{Bark, Feishu, Multi, Notification, Notifier, NotifyError, Sound};
+use apw_core::notify::{Bark, Discord, Feishu, Multi, Notification, Notifier, NotifyError, Sound};
 
 // ---------------------------------------------------------------------------
 // 极简 HTTP 测试服务端
@@ -25,6 +25,7 @@ use apw_core::notify::{Bark, Feishu, Multi, Notification, Notifier, NotifyError,
 struct TestServer {
     addr: SocketAddr,
     requests: Arc<Mutex<Vec<String>>>,
+    bodies: Arc<Mutex<Vec<Vec<u8>>>>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -45,9 +46,11 @@ impl TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
         let addr = listener.local_addr().expect("取本地地址");
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
 
         let join = {
             let requests = Arc::clone(&requests);
+            let bodies = Arc::clone(&bodies);
             std::thread::spawn(move || {
                 // 不应答时也要把连接握住：一旦提前析构，客户端拿到的就是连接被
                 // 重置，测出来的是另一回事。
@@ -67,16 +70,31 @@ impl TestServer {
                     if request_line.trim().is_empty() {
                         break;
                     }
-                    // 把请求头读完，避免客户端还没写完我们就把连接关了。
+                    // 把请求头和请求体读完，避免客户端还没写完我们就把连接关了。
+                    // Bark 是 GET 没有正文；飞书和 Discord 的 JSON POST 有 Content-Length。
+                    let mut content_length = 0usize;
                     loop {
                         let mut header = String::new();
                         match reader.read_line(&mut header) {
                             Ok(0) => break,
                             Ok(_) if header.trim().is_empty() => break,
-                            Ok(_) => {}
+                            Ok(_) => {
+                                if let Some(value) = header
+                                    .split_once(':')
+                                    .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                                    .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                                {
+                                    content_length = value;
+                                }
+                            }
                             Err(_) => break,
                         }
                     }
+                    let mut body = vec![0; content_length];
+                    if content_length > 0 {
+                        let _ = reader.read_exact(&mut body);
+                    }
+                    bodies.lock().expect("记录请求体").push(body);
                     requests
                         .lock()
                         .expect("记录请求")
@@ -101,6 +119,7 @@ impl TestServer {
         Self {
             addr,
             requests,
+            bodies,
             join: Some(join),
         }
     }
@@ -114,8 +133,21 @@ impl TestServer {
         format!("http://{}/devkey", self.addr)
     }
 
+    fn discord_url(&self) -> String {
+        format!("http://{}/api/webhooks/123/secret-token", self.addr)
+    }
+
     fn count(&self) -> usize {
         self.requests.lock().expect("读请求").len()
+    }
+
+    fn body(&self) -> Vec<u8> {
+        self.bodies
+            .lock()
+            .expect("读请求体")
+            .first()
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// 第一条请求的原始请求目标，即 `GET` 与 `HTTP/1.1` 之间那一段。
@@ -351,6 +383,56 @@ async fn bark地址不合法时报错且不发请求() {
             .expect_err(&format!("{bad:?} 不该被接受"));
         assert!(matches!(err, NotifyError::Config { .. }), "{bad:?}：{err}");
     }
+    assert_eq!(server.count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Discord
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn discord接受二零四成功响应() {
+    let server = TestServer::start("204 No Content", "");
+    Discord::new(server.discord_url(), client())
+        .notify(&到货通知())
+        .await
+        .expect("Discord webhook 的 204 应当算成功");
+    assert_eq!(server.count(), 1);
+    assert_eq!(server.target(), "/api/webhooks/123/secret-token");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&server.body()).expect("请求体应为 JSON");
+    assert_eq!(
+        payload.get("content").and_then(serde_json::Value::as_str),
+        Some(
+            "到货/提醒
+上海-环球港 iPhone 17 有货
+https://www.apple.com.cn/shop/bag?step=1&next=2"
+        )
+    );
+    assert_eq!(payload["allowed_mentions"]["parse"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn discord拒绝响应会带渠道和状态码() {
+    let server = TestServer::start("401 Unauthorized", r#"{"message":"Invalid Webhook Token"}"#);
+    let err = Discord::new(server.discord_url(), client())
+        .notify(&到货通知())
+        .await
+        .expect_err("失效 webhook 必须报错");
+    assert_eq!(err.channel(), Some("Discord"));
+    assert!(
+        matches!(err, NotifyError::Rejected { status: 401, .. }),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn discord地址为空时不发请求() {
+    let server = TestServer::start("204 No Content", "");
+    Discord::new("  ".to_string(), client())
+        .notify(&到货通知())
+        .await
+        .expect("未配置不是错误");
     assert_eq!(server.count(), 0);
 }
 
@@ -649,7 +731,7 @@ fn closed_port() -> SocketAddr {
     // listener 在这里析构，端口随即关闭。
 }
 
-/// Bark 的设备 key、飞书机器人的密钥都在地址的路径里。错误信息会原样进日志，
+/// Bark 的设备 key、飞书与 Discord 的 webhook token 都在地址路径里。错误信息会原样进日志，
 /// 用户排查问题时常把日志贴进公开的 issue，所以错误文本里只能有协议和主机。
 fn assert_no_secret(err: &NotifyError, secret: &str) {
     let text = err.to_string();
@@ -682,6 +764,20 @@ async fn 飞书连不上时错误信息里没有机器人密钥() {
     assert!(matches!(err, NotifyError::Transport { .. }), "{err}");
     assert_no_secret(&err, "SECRET-HOOK-TOKEN");
     assert!(err.to_string().contains("error sending request："), "{err}");
+}
+
+#[tokio::test]
+async fn discord连不上时错误信息里没有webhook令牌() {
+    let addr = closed_port();
+    let err = Discord::new(
+        format!("http://{addr}/api/webhooks/123/SECRET-DISCORD-TOKEN"),
+        client(),
+    )
+    .notify(&到货通知())
+    .await
+    .expect_err("端口没人监听，推送必须失败");
+    assert!(matches!(err, NotifyError::Transport { .. }), "{err}");
+    assert_no_secret(&err, "SECRET-DISCORD-TOKEN");
 }
 
 #[tokio::test]

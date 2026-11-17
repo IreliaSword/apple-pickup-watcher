@@ -9,7 +9,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use apw_core::config::{
     ConfigError, DEFAULT_INTERVAL_SECONDS, MAX_SETTINGS_BYTES, Settings, SettingsStore,
@@ -86,8 +86,10 @@ fn 样例设置() -> Settings {
         locale: "zh_CN".into(),
         targets: vec![目标("R683", "MG724CH/A"), 目标("R448", "MG0A4CH/A")],
         interval_seconds: 45,
+        interval_max_seconds: 75,
         bark_url: "https://api.day.app/xxxx".into(),
         feishu_webhook: "https://open.feishu.cn/open-apis/bot/v2/hook/yyyy".into(),
+        discord_webhook: "https://discord.com/api/webhooks/123/token".into(),
         sound_enabled: false,
         open_bag_on_hit: true,
         proxies: Vec::new(),
@@ -496,8 +498,10 @@ fn 设置的线上格式是小驼峰() {
         "locale",
         "targets",
         "intervalSeconds",
+        "intervalMaxSeconds",
         "barkUrl",
         "feishuWebhook",
+        "discordWebhook",
         "soundEnabled",
         "openBagOnHit",
         "proxies",
@@ -505,7 +509,7 @@ fn 设置的线上格式是小驼峰() {
         assert!(obj.contains_key(key), "缺少字段 {key}：{value}");
     }
     assert!(!obj.contains_key("interval_seconds"), "不该有蛇形字段");
-    assert_eq!(obj.len(), 8);
+    assert_eq!(obj.len(), 10);
 }
 
 #[test]
@@ -598,7 +602,7 @@ fn 代理地址只留合法的并去重() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn 推送地址按长相归到bark或飞书() {
+fn 推送地址按长相归到bark飞书或discord() {
     use apw_core::config::{PushKind, push_kind};
 
     for feishu in [
@@ -609,6 +613,13 @@ fn 推送地址按长相归到bark或飞书() {
         "open.feishu.cn/open-apis/bot/v2/hook/abc",
     ] {
         assert_eq!(push_kind(feishu), PushKind::Feishu, "{feishu:?}");
+    }
+    for discord in [
+        "https://discord.com/api/webhooks/123/token",
+        "https://discordapp.com/api/webhooks/123/token",
+        " discord.com/api/webhooks/123/token ",
+    ] {
+        assert_eq!(push_kind(discord), PushKind::Discord, "{discord:?}");
     }
     for bark in [
         "https://api.day.app/key",
@@ -628,6 +639,7 @@ fn 推送地址整组替换时各归各的渠道并去重() {
     let b1 = "https://api.day.app/b1";
     let b2 = "https://api.day.app/b2";
     let f1 = "https://open.feishu.cn/open-apis/bot/v2/hook/f1";
+    let d1 = "https://discord.com/api/webhooks/123/token";
     let mut s = Settings::default();
     s.set_push_urls(&[
         format!(" {f1} "),
@@ -635,23 +647,25 @@ fn 推送地址整组替换时各归各的渠道并去重() {
         String::new(),
         // 老版本里用分号连着的一整串被粘进了同一行。
         format!("{b2};{b1}"),
+        d1.to_string(),
     ]);
     assert_eq!(s.bark_url, format!("{b1};{b2}"));
     assert_eq!(s.feishu_webhook, f1);
-    // 读回来是 Bark 在前、飞书在后，各自保持填写顺序。
-    assert_eq!(s.push_urls(), vec![b1, b2, f1]);
+    assert_eq!(s.discord_webhook, d1);
+    // 读回来是 Bark、飞书、Discord，各自保持填写顺序。
+    assert_eq!(s.push_urls(), vec![b1, b2, f1, d1]);
 
     s.set_push_urls(&[]);
-    assert!(s.bark_url.is_empty() && s.feishu_webhook.is_empty());
+    assert!(s.bark_url.is_empty() && s.feishu_webhook.is_empty() && s.discord_webhook.is_empty());
     assert!(s.push_urls().is_empty());
 }
 
 #[test]
-fn 填在bark一栏的飞书地址规范化后挪到飞书() {
+fn 填在bark一栏的webhook规范化后挪到对应渠道() {
     // 支持飞书之前只有 Bark 一栏可填，有人把飞书地址填了进去。升级后它应当
     // 自己挪到飞书，开始正常推送，而不是一直按 Bark 的格式发、一直报错。
     let mut s = Settings {
-        bark_url: "https://api.day.app/b1;https://open.feishu.cn/open-apis/bot/v2/hook/f1".into(),
+        bark_url: "https://api.day.app/b1;https://open.feishu.cn/open-apis/bot/v2/hook/f1;https://discord.com/api/webhooks/123/token".into(),
         ..Settings::default()
     };
     s.normalize();
@@ -660,9 +674,44 @@ fn 填在bark一栏的飞书地址规范化后挪到飞书() {
         s.feishu_webhook,
         "https://open.feishu.cn/open-apis/bot/v2/hook/f1"
     );
+    assert_eq!(
+        s.discord_webhook,
+        "https://discord.com/api/webhooks/123/token"
+    );
 
     // 再规范化一次结果不变。
     let once = s.clone();
     s.normalize();
     assert_eq!(s, once);
+}
+
+#[test]
+fn 查询间隔范围规范化并兼容旧设置() {
+    let mut range = Settings {
+        interval_seconds: 60,
+        interval_max_seconds: 90,
+        ..Settings::default()
+    };
+    range.normalize();
+    assert_eq!(range.interval_seconds, 60);
+    assert_eq!(range.interval_max_seconds, 90);
+    assert_eq!(
+        range.interval_range(),
+        (Duration::from_secs(60), Duration::from_secs(90))
+    );
+
+    let mut reversed = Settings {
+        interval_seconds: 90,
+        interval_max_seconds: 60,
+        ..Settings::default()
+    };
+    reversed.normalize();
+    assert_eq!(reversed.interval_max_seconds, 90);
+
+    let mut old: Settings = serde_json::from_str(
+        r#"{"locale":"zh_CN","targets":[],"intervalSeconds":60,"barkUrl":"","soundEnabled":true,"openBagOnHit":true}"#,
+    )
+    .expect("没有最长间隔字段的旧设置应当可读");
+    old.normalize();
+    assert_eq!((old.interval_seconds, old.interval_max_seconds), (60, 60));
 }

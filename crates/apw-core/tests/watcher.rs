@@ -1210,3 +1210,36 @@ async fn 请求预算会把等待拉长并在事件里说明() {
     let (_, paced, _) = cycle_complete(&events);
     assert!(!paced);
 }
+
+#[tokio::test]
+async fn 显式查询范围每轮生成范围内的等待时间() {
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::OutOfStock)));
+    let (w, mut rx) = Watcher::spawn(fake, fast_config());
+    w.set_interval_range(Duration::from_secs(60), Duration::from_secs(90))
+        .await;
+    w.set_targets(vec![target("R359", "MG724CH/A")]).await;
+    w.start().await;
+    let events = wait_cycle(&mut rx).await;
+    w.stop().await;
+
+    let (secs, paced, _) = cycle_complete(&events);
+    assert!((60..=90).contains(&secs), "随机等待越界：{secs} 秒");
+    assert!(!paced, "范围内随机不是请求预算节流");
+}
+
+#[tokio::test]
+async fn 反向查询范围按固定下限处理() {
+    let fake =
+        FakeFetcher::new(|_, store, parts| Ok(ok_response(store, parts, Availability::OutOfStock)));
+    let (w, mut rx) = Watcher::spawn(fake, fast_config());
+    w.set_interval_range(Duration::from_secs(75), Duration::from_secs(60))
+        .await;
+    w.set_targets(vec![target("R359", "MG724CH/A")]).await;
+    w.start().await;
+    let events = wait_cycle(&mut rx).await;
+    w.stop().await;
+
+    let (secs, _, _) = cycle_complete(&events);
+    assert_eq!(secs, 75);
+}

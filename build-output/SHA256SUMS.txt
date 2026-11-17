@@ -1,0 +1,2 @@
+17d19ae3422884b1af4ec2286f19635467e9975b56a38b4d60ad2217281a0182 *build-output/Apple-Pickup-Watcher-0.7.0-x64-portable.exe
+d9584bb52836632b80beb4e3a23f180162a1d7ec909fc78484488020a0baf915 *build-output/Apple-Pickup-Watcher-0.7.0-x64-setup.exe

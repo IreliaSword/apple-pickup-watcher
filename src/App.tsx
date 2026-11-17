@@ -60,7 +60,7 @@ import {
   refreshProducts,
   saveSettings,
   setCategory,
-  setIntervalSeconds,
+  setIntervalRange,
   setPushUrls,
   setTargets,
   startWatching,
@@ -153,12 +153,13 @@ export default function App() {
   // 刚加进去几个。新的一组排在列表后面，可能被面板挡着或者要滚动才看得到，
   // 面板底部说一声。
   const [justAdded, setJustAdded] = useState(0);
-  // 推送地址：Bark 和飞书是同一个列表，一行一个。null 表示还没动过，跟着后端走；
+  // 推送地址：Bark、飞书和 Discord 是同一个列表，一行一个。null 表示还没动过，跟着后端走；
   // 动过之后以这份为准，保持用户填写的顺序，渠道标签按后端的归类显示。
   const [pushDraft, setPushDraft] = useState<string[] | null>(null);
   // 代理地址和推送地址一样一行一个，草稿的规矩也相同，见 pushDraft。
   const [proxyDraft, setProxyDraft] = useState<string[] | null>(null);
-  const [intervalDraft, setIntervalDraft] = useState<number | null>(null);
+  const [intervalMinDraft, setIntervalMinDraft] = useState<number | null>(null);
+  const [intervalMaxDraft, setIntervalMaxDraft] = useState<number | null>(null);
 
   function openAdd() {
     setJustAdded(0);
@@ -205,7 +206,18 @@ export default function App() {
       void saveSettings({ ...ui.settings, proxies });
     }
   }
-  const intervalValue = intervalDraft ?? ui.settings.intervalSeconds;
+  const intervalMinValue = intervalMinDraft ?? ui.settings.intervalSeconds;
+  // 升级前保存的设置没有 intervalMaxSeconds；缺失时沿用最短值，保持旧版固定间隔。
+  const savedIntervalMax = ui.settings.intervalMaxSeconds ?? ui.settings.intervalSeconds;
+  const intervalMaxValue = intervalMaxDraft ?? savedIntervalMax;
+
+  function commitIntervalRange() {
+    const min = Number.isFinite(intervalMinValue) ? Math.round(intervalMinValue) : 30;
+    const max = Number.isFinite(intervalMaxValue) ? Math.round(intervalMaxValue) : min;
+    setIntervalMinDraft(null);
+    setIntervalMaxDraft(null);
+    void setIntervalRange(min, max);
+  }
 
   const storeOptions = useMemo(
     () => ui.stores.map((s) => ({ value: s.number, label: s.title })),
@@ -342,7 +354,9 @@ export default function App() {
       text:
         ui.pacing !== null && ui.pacing.paced
           ? `受 Apple 频率限制，下一轮 ${ui.pacing.nextCheckInSecs} 秒后`
-          : `每 ${ui.settings.intervalSeconds} 秒查一轮`,
+          : savedIntervalMax === ui.settings.intervalSeconds
+            ? `每 ${ui.settings.intervalSeconds} 秒查一轮`
+            : `每轮随机 ${ui.settings.intervalSeconds}–${savedIntervalMax} 秒`,
     });
   }
   if (summary.lastChecked !== null) {
@@ -642,24 +656,38 @@ export default function App() {
           <SheetBody className="grid content-start gap-7">
             <SettingsSection title="查询">
               <div className="flex items-center justify-between gap-4">
-                <Label htmlFor="interval">查询间隔</Label>
-                <div className="flex items-center gap-2">
+                <Label htmlFor="interval-min">随机查询间隔</Label>
+                <div
+                  className="flex items-center gap-2"
+                  onBlur={(event) => {
+                    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                      commitIntervalRange();
+                    }
+                  }}
+                >
                   <Input
-                    id="interval"
+                    id="interval-min"
+                    aria-label="最短查询间隔"
                     type="number"
                     min={5}
                     className="h-8 w-20 select-text"
-                    value={intervalValue}
-                    onChange={(e) => setIntervalDraft(e.target.valueAsNumber)}
-                    onBlur={() => {
-                      const s = Number.isFinite(intervalValue) ? Math.round(intervalValue) : 30;
-                      setIntervalDraft(null);
-                      void setIntervalSeconds(s);
-                    }}
+                    value={intervalMinValue}
+                    onChange={(e) => setIntervalMinDraft(e.target.valueAsNumber)}
+                  />
+                  <span className="text-muted-foreground text-sm">至</span>
+                  <Input
+                    id="interval-max"
+                    aria-label="最长查询间隔"
+                    type="number"
+                    min={5}
+                    className="h-8 w-20 select-text"
+                    value={intervalMaxValue}
+                    onChange={(e) => setIntervalMaxDraft(e.target.valueAsNumber)}
                   />
                   <span className="text-muted-foreground text-sm">秒</span>
                 </div>
               </div>
+              <p className="text-muted-foreground text-xs">每轮结束后都会在这个范围内重新随机。</p>
             </SettingsSection>
 
             <SettingsSection title="提醒">
@@ -685,7 +713,7 @@ export default function App() {
                     推送地址
                   </Label>
                   <span className="text-muted-foreground min-w-0 truncate text-xs">
-                    Bark 或飞书群机器人，一行一个
+                    Bark、飞书或 Discord Webhook，一行一个
                   </span>
                   {lastPushRow.trim() !== "" && (
                     <Button
@@ -703,7 +731,7 @@ export default function App() {
                   return (
                     <div key={index} className="flex items-center gap-2">
                       {/* 渠道标签占固定宽度：还没保存的行留空，输入框照样对齐。 */}
-                      <span className="flex w-12 shrink-0 justify-center">
+                      <span className="flex w-18 shrink-0 justify-center">
                         {kind !== undefined && (
                           <Badge variant="outline" className="text-muted-foreground">
                             {PUSH_KIND_LABEL[kind]}
@@ -714,7 +742,7 @@ export default function App() {
                         id={`push-${index}`}
                         aria-label={`推送地址 ${index + 1}`}
                         className="select-text"
-                        placeholder="Bark 地址，或飞书群机器人的 webhook"
+                        placeholder="Bark、飞书或 Discord webhook"
                         value={row}
                         // 只有点「添加」新开的那一行自动聚焦；打开面板时的空行不抢焦点。
                         autoFocus={pushDraft !== null && row === "" && index > 0}
@@ -737,8 +765,13 @@ export default function App() {
                 })}
                 {savedPush.some((p) => p.kind === "feishu") && (
                   // 飞书机器人最常见的配置错误是安全设置，只在真填了飞书地址时提醒。
-                  <p className="text-muted-foreground pl-14 text-xs">
+                  <p className="text-muted-foreground pl-20 text-xs">
                     飞书机器人的安全设置请选「自定义关键词」，填「有货」。
+                  </p>
+                )}
+                {savedPush.some((p) => p.kind === "discord") && (
+                  <p className="text-muted-foreground pl-20 text-xs">
+                    Discord：服务器设置 → 连携服务 → Webhooks，复制 Webhook URL。
                   </p>
                 )}
               </div>

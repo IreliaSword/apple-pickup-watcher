@@ -15,7 +15,7 @@ use apw_core::apple::{AppleClient, ClientConfig};
 use apw_core::catalog::Catalog;
 use apw_core::config::{MIN_INTERVAL_SECONDS, Settings, SettingsStore};
 use apw_core::model::{Category, Product, REGIONS, Store, Target, region_by_locale};
-use apw_core::notify::{Bark, Feishu, Multi, Notification, Notifier, Sound};
+use apw_core::notify::{Bark, Discord, Feishu, Multi, Notification, Notifier, Sound};
 use apw_core::watcher::{Event, TargetState, Watcher, WatcherConfig};
 use serde::Serialize;
 use tauri::menu::{Menu, MenuItem};
@@ -160,7 +160,8 @@ async fn save_settings(
 
     // 设置里的目标列表和查询间隔要同步给引擎，否则改完设置监控还按旧的跑。
     state.watcher.set_targets(next.targets.clone()).await;
-    state.watcher.set_interval(next.interval()).await;
+    let (min, max) = next.interval_range();
+    state.watcher.set_interval_range(min, max).await;
     // 代理变了就换线路，立即生效；地址解析不了就把错误报回界面，其余设置照存。
     if next.proxies != state.settings_snapshot().proxies {
         state
@@ -176,7 +177,7 @@ async fn save_settings(
 
 /// 用界面上的推送地址列表整体替换现有的。
 ///
-/// 每个地址是 Bark 还是飞书由 [`Settings::set_push_urls`] 按长相判断，界面不自己猜。
+/// 每个地址是 Bark、飞书还是 Discord 由 [`Settings::set_push_urls`] 按长相判断，界面不自己猜。
 /// 只动推送地址：不经过 [`save_settings`]，免得顺带把引擎的目标、间隔和代理
 /// 也重新下发一遍。
 #[tauri::command]
@@ -212,13 +213,22 @@ async fn set_targets(
 }
 
 #[tauri::command]
-async fn set_interval(state: tauri::State<'_, AppState>, seconds: u64) -> Result<u64, String> {
-    let secs = seconds.max(MIN_INTERVAL_SECONDS);
-    state.watcher.set_interval(Duration::from_secs(secs)).await;
+async fn set_interval_range(
+    state: tauri::State<'_, AppState>,
+    min_seconds: u64,
+    max_seconds: u64,
+) -> Result<Settings, String> {
+    let min = min_seconds.max(MIN_INTERVAL_SECONDS);
+    let max = max_seconds.max(min);
+    state
+        .watcher
+        .set_interval_range(Duration::from_secs(min), Duration::from_secs(max))
+        .await;
     let mut next = state.settings_snapshot();
-    next.interval_seconds = secs;
-    state.put_settings(next)?;
-    Ok(secs)
+    next.interval_seconds = min;
+    next.interval_max_seconds = max;
+    state.put_settings(next.clone())?;
+    Ok(next)
 }
 
 #[tauri::command]
@@ -308,7 +318,7 @@ async fn test_notify(app: AppHandle) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
-/// 发出一条提醒：系统通知 + 提示音 + Bark，按用户设置取舍。
+/// 发出一条提醒：系统通知、提示音与网络推送，按用户设置取舍。
 async fn dispatch_notification(
     app: &AppHandle,
     notification: Notification,
@@ -347,6 +357,15 @@ async fn dispatch_notification(
         // 共享连接池，渠道各自报错。
         for feishu in Feishu::from_list(&settings.feishu_webhook, http) {
             channels.push(feishu);
+        }
+    }
+    if !settings.discord_webhook.trim().is_empty() {
+        let http = app
+            .try_state::<AppState>()
+            .map(|s| s.http.clone())
+            .unwrap_or_default();
+        for discord in Discord::from_list(&settings.discord_webhook, http) {
+            channels.push(discord);
         }
     }
     if channels.is_empty() {
@@ -561,10 +580,10 @@ pub fn run() {
             {
                 let watcher = watcher.clone();
                 let targets = settings.targets.clone();
-                let interval = settings.interval();
+                let (interval_min, interval_max) = settings.interval_range();
                 tauri::async_runtime::spawn(async move {
                     watcher.set_targets(targets).await;
-                    watcher.set_interval(interval).await;
+                    watcher.set_interval_range(interval_min, interval_max).await;
                 });
             }
 
@@ -616,7 +635,7 @@ pub fn run() {
             set_push_urls,
             get_snapshot,
             set_targets,
-            set_interval,
+            set_interval_range,
             start_watching,
             stop_watching,
             is_running,
