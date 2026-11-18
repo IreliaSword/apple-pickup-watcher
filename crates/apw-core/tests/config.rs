@@ -93,6 +93,8 @@ fn 样例设置() -> Settings {
         sound_enabled: false,
         open_bag_on_hit: true,
         proxies: Vec::new(),
+        auto_proxy_pool_enabled: false,
+        auto_proxy_pool_source: "publicFeeds".into(),
     }
 }
 
@@ -509,7 +511,7 @@ fn 设置的线上格式是小驼峰() {
         assert!(obj.contains_key(key), "缺少字段 {key}：{value}");
     }
     assert!(!obj.contains_key("interval_seconds"), "不该有蛇形字段");
-    assert_eq!(obj.len(), 10);
+    assert_eq!(obj.len(), 12);
 }
 
 #[test]
@@ -714,4 +716,24 @@ fn 查询间隔范围规范化并兼容旧设置() {
     .expect("没有最长间隔字段的旧设置应当可读");
     old.normalize();
     assert_eq!((old.interval_seconds, old.interval_max_seconds), (60, 60));
+}
+
+#[test]
+fn 旧配置默认关闭自动池且未知来源不会注入任意地址() {
+    let mut settings: Settings =
+        serde_json::from_str(r#"{"proxies":["http://127.0.0.1:8080"]}"#).unwrap();
+    assert!(!settings.auto_proxy_pool_enabled);
+    assert_eq!(settings.auto_proxy_pool_source, "publicFeeds");
+    settings.auto_proxy_pool_enabled = true;
+    settings.auto_proxy_pool_source = "https://untrusted.invalid/feed".into();
+    settings.normalize();
+    assert_eq!(settings.auto_proxy_pool_source, "publicFeeds");
+    assert_eq!(settings.proxies, vec!["http://127.0.0.1:8080"]);
+    settings.auto_proxy_pool_source = "proxy5Browser".into();
+    settings.normalize();
+    let encoded = serde_json::to_vec(&settings).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Settings>(&encoded).unwrap(),
+        settings
+    );
 }

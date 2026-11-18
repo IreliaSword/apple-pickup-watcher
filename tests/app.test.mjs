@@ -89,6 +89,9 @@ function renderApp() {
   const isAddPush = (element) => element.type === "Button" &&
     Array.isArray(element.props.children) && element.props.children.includes(" 添加推送地址");
   return {
+    autoPool: () => control((element) => element?.props?.id === "auto-proxy-pool"),
+    autoSource: () => control((element) => element?.props?.id === "auto-proxy-source"),
+    autoRows: () => all((element) => /^自动代理地址 /.test(element?.props?.["aria-label"] ?? "")),
     intervalInput: (edge) => control((element) => element?.props?.id === `interval-${edge}`),
     intervalGroup: () => control((element) => element?.type === "div" &&
       typeof element.props?.onBlur === "function"),
@@ -439,4 +442,23 @@ test("the add panel says how many of the picked combinations are already being w
   app.choice("选择自提门店").onChange(["R532"]);
   assert.equal(app.scaleHint().children.join(""), "1 个型号 × 1 家门店，都已在监控列表里");
   assert.equal(app.addButton().disabled, true, "全都在列表里时没有可加的，按钮不该亮着");
+});
+
+test("automatic proxy mode retains manual addresses and renders only candidate rows", async () => {
+  const app = renderApp();
+  app.state.settings.proxies = ["http://127.0.0.1:1080"];
+  app.autoPool().onCheckedChange(true);
+  await new Promise(setImmediate);
+  assert.equal(app.state.settings.autoProxyPoolEnabled, true);
+  assert.deepEqual(app.state.settings.proxies, ["http://127.0.0.1:1080"]);
+  assert.equal(app.proxyValues().length, 0);
+  app.state.proxyPool = { entries: [{ url: "http://8.8.8.8:8080", source: "fixture", connectionFailures: 0, responded: false }], sourceState: "ready", message: "unverified" };
+  assert.equal(app.autoRows().length, 1);
+  assert.equal(app.autoRows()[0].props.readOnly, true);
+  app.autoSource().onChange({ target: { value: "proxy5Browser" } });
+  await new Promise(setImmediate);
+  assert.equal(app.state.settings.autoProxyPoolSource, "proxy5Browser");
+  app.autoPool().onCheckedChange(false);
+  await new Promise(setImmediate);
+  assert.deepEqual(app.proxyValues(), ["http://127.0.0.1:1080"]);
 });

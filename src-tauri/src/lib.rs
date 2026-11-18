@@ -25,6 +25,7 @@ use tauri_plugin_updater::UpdaterExt;
 
 mod auto_open;
 mod notification_queue;
+mod proxy_pool;
 
 use auto_open::AutoOpenBag;
 
@@ -57,8 +58,7 @@ struct CategoryDto {
 
 struct AppState {
     watcher: Watcher,
-    /// 和引擎共用的 Apple 客户端句柄，改代理设置时用它换线路，不用重启。
-    client: AppleClient,
+    pool: proxy_pool::PoolService,
     catalog: Catalog,
     http: reqwest::Client,
     /// 设置的内存副本。写盘失败不该让界面卡住，所以内存副本是权威的展示来源。
@@ -150,6 +150,7 @@ fn get_settings(state: tauri::State<'_, AppState>) -> Settings {
 
 #[tauri::command]
 async fn save_settings(
+    app: AppHandle,
     state: tauri::State<'_, AppState>,
     settings: Settings,
 ) -> Result<Settings, String> {
@@ -162,14 +163,15 @@ async fn save_settings(
     state.watcher.set_targets(next.targets.clone()).await;
     let (min, max) = next.interval_range();
     state.watcher.set_interval_range(min, max).await;
-    // 代理变了就换线路，立即生效；地址解析不了就把错误报回界面，其余设置照存。
-    if next.proxies != state.settings_snapshot().proxies {
-        state
-            .client
-            .set_proxies(&next.proxies)
-            .await
-            .map_err(|e| format!("代理设置未生效：{e}"))?;
-    }
+    state
+        .pool
+        .configure(
+            next.auto_proxy_pool_enabled,
+            &next.auto_proxy_pool_source,
+            &next.proxies,
+            &app,
+        )
+        .await?;
 
     state.put_settings(next.clone())?;
     Ok(next)
@@ -190,6 +192,20 @@ async fn set_push_urls(
     next.normalize();
     state.put_settings(next.clone())?;
     Ok(next)
+}
+
+#[tauri::command]
+async fn get_proxy_pool_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<proxy_pool::PoolStatus, String> {
+    Ok(state.pool.status().await)
+}
+
+#[tauri::command]
+async fn refresh_proxy_pool(
+    state: tauri::State<'_, AppState>,
+) -> Result<proxy_pool::PoolStatus, String> {
+    state.pool.refresh().await
 }
 
 #[tauri::command]
@@ -406,6 +422,12 @@ async fn pump_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<Eve
         // 先原样转发。前端拿到的事件流应当与引擎发出的完全一致，
         // 中间少一层可能出错的翻译。
         let _ = app.emit(EVENT_CHANNEL, &event);
+        if matches!(&event, Event::CycleComplete { .. }) {
+            let pool = app.try_state::<AppState>().map(|s| s.pool.clone());
+            if let Some(pool) = pool {
+                pool.on_round(&app).await;
+            }
+        }
 
         if let Event::RunStateChanged { running } = &event {
             auto_open_bag.on_run_state_changed(*running);
@@ -565,7 +587,12 @@ pub fn run() {
             catalog.attach_locations(&mut settings.targets);
 
             let client = AppleClient::new(ClientConfig {
-                proxies: settings.proxies.clone(),
+                proxies: if settings.auto_proxy_pool_enabled {
+                    vec![]
+                } else {
+                    settings.proxies.clone()
+                },
+                proxies_only: settings.auto_proxy_pool_enabled,
                 ..ClientConfig::default()
             })
             .map_err(|e| format!("构造 Apple 客户端失败：{e}"))?;
@@ -587,9 +614,19 @@ pub fn run() {
                 });
             }
 
+            let pool = proxy_pool::PoolService::new(
+                client.clone(),
+                settings.auto_proxy_pool_enabled,
+                settings.auto_proxy_pool_source.clone(),
+                app.path()
+                    .app_cache_dir()
+                    .unwrap_or_else(|_| std::env::temp_dir().join("apw"))
+                    .join("proxy5-browser"),
+            );
+            let pool_task = pool.clone();
             app.manage(AppState {
                 watcher,
-                client,
+                pool,
                 catalog,
                 http: reqwest::Client::new(),
                 settings: RwLock::new(settings),
@@ -597,6 +634,7 @@ pub fn run() {
             });
 
             let handle: AppHandle = app.handle().clone();
+            tauri::async_runtime::spawn(pool_task.run(handle.clone()));
             tauri::async_runtime::spawn(pump_events(handle.clone(), events));
 
             if let Err(err) = setup_tray(&handle) {
@@ -631,6 +669,8 @@ pub fn run() {
             list_products,
             refresh_products,
             get_settings,
+            get_proxy_pool_status,
+            refresh_proxy_pool,
             save_settings,
             set_push_urls,
             get_snapshot,

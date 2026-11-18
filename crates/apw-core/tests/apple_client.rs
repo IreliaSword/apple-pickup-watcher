@@ -878,3 +878,113 @@ async fn 换代理立即生效并按线路各自记预算() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn 自动代理空池不回退直连且诊断不崩溃() {
+    let apple = FakeApple::start(healthy).await;
+    let client = fast(ClientConfig {
+        proxies_only: true,
+        ..ClientConfig::default()
+    });
+    assert!(client.route_labels().await.is_empty());
+    let err = client
+        .pickup_message(apple.region(), "R683", &["PART".into()])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ApiError::Blocked(_)));
+    assert!(apple.requests(PICKUP_PATH).is_empty());
+    assert!(
+        client
+            .cookie_names_for("https://example.com")
+            .await
+            .is_empty()
+    );
+    assert!(client.cookies_for(apple.region()).await.is_none());
+    assert!(
+        client
+            .negotiated_http_version(apple.region())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn 增减其他代理保留已有线路标签及冷却() {
+    let apple = FakeApple::start(|path| {
+        if path.starts_with(PICKUP_PATH) {
+            (541, vec![], "blocked".into())
+        } else {
+            healthy(path)
+        }
+    })
+    .await;
+    let a = FakeProxy::start("keep").await;
+    let b = FakeProxy::start("added").await;
+    let client = fast(ClientConfig {
+        proxies: vec![a.url()],
+        proxies_only: true,
+        warm_page: WarmPage::None,
+        ..ClientConfig::default()
+    });
+    let part = ["PART".into()];
+    client
+        .pickup_message(apple.region(), "R683", &part)
+        .await
+        .unwrap_err();
+    let before = a.hits();
+    let label = client.route_labels().await[0].clone();
+    client
+        .update_proxy_routes(&[a.url(), b.url()], true)
+        .await
+        .unwrap();
+    assert_eq!(client.route_labels().await[0], label);
+    client.update_proxy_routes(&[a.url()], true).await.unwrap();
+    let err = client
+        .pickup_message(apple.region(), "R683", &part)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("冷却"));
+    assert_eq!(a.hits(), before, "保留的线路不能因替换其他代理而重新出站");
+    assert_eq!(client.recent_requests().await.len(), 1);
+    assert_eq!(client.recent_requests().await[0].sequence, 1);
+}
+
+#[tokio::test]
+async fn 替换其他线路不恢复已消耗预算且不丢失cookie() {
+    let apple = FakeApple::start(healthy).await;
+    let a = FakeProxy::start("retained").await;
+    let b = FakeProxy::start("temporary").await;
+    let client = fast(ClientConfig {
+        proxies: vec![a.url()],
+        proxies_only: true,
+        budget: apw_core::apple::Budget {
+            capacity: 2,
+            refill_every: Duration::from_secs(60),
+        },
+        ..ClientConfig::default()
+    });
+    client
+        .pickup_message(apple.region(), "R101", &["PART".into()])
+        .await
+        .unwrap();
+    assert!(client.pacing_delay(1).await > Duration::from_secs(50));
+    let names = client
+        .cookie_names_for(&apple.region().pickup_message_url())
+        .await;
+    assert!(names.iter().any(|name| name == "dssid2"));
+    client
+        .update_proxy_routes(&[a.url(), b.url()], true)
+        .await
+        .unwrap();
+    client.update_proxy_routes(&[a.url()], true).await.unwrap();
+    assert!(
+        client.pacing_delay(1).await > Duration::from_secs(50),
+        "保留线路不能重新发放预算"
+    );
+    assert_eq!(
+        client
+            .cookie_names_for(&apple.region().pickup_message_url())
+            .await,
+        names
+    );
+}

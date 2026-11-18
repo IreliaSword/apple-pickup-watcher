@@ -26,3 +26,7 @@ pub mod model;
 #[cfg(feature = "notifications")]
 pub mod notify;
 pub mod watcher;
+
+pub mod proxy_pool;
+
+pub mod proxy_sources;

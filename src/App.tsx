@@ -58,6 +58,7 @@ import {
   dismissUpdate,
   installUpdate,
   refreshProducts,
+  refreshAutoProxyPool,
   saveSettings,
   setCategory,
   setIntervalRange,
@@ -787,6 +788,37 @@ export default function App() {
             </SettingsSection>
 
             <SettingsSection title="网络">
+              <div className="flex items-center justify-between gap-3">
+                <Label htmlFor="auto-proxy-pool">自动代理池（仅代理，不走直连）</Label>
+                <Switch id="auto-proxy-pool" checked={Boolean(ui.settings.autoProxyPoolEnabled)}
+                  onCheckedChange={(enabled) => void saveSettings({ ...ui.settings, autoProxyPoolEnabled: enabled })} />
+              </div>
+              <p className="text-muted-foreground text-xs">目标保持 5 个候选，不保证始终有 5 个可用。541 保留冷却；连续两轮实际连接失败才淘汰补位。免费代理不用于登录或下单。</p>
+              {ui.settings.autoProxyPoolEnabled ? (
+                <div className="grid gap-2">
+                  <Label htmlFor="auto-proxy-source">候选来源</Label>
+                  <select id="auto-proxy-source" aria-label="自动代理来源" className="border-input bg-background rounded-md border p-2 text-sm"
+                    value={ui.settings.autoProxyPoolSource ?? "publicFeeds"}
+                    onChange={(event) => void saveSettings({ ...ui.settings, autoProxyPoolSource: event.target.value as "publicFeeds" | "proxy5Browser" })}>
+                    <option value="publicFeeds">公开订阅：monosans / Proxifly</option>
+                    <option value="proxy5Browser">Proxy5 网页表格（需要 Chrome 和 Node.js 22+）</option>
+                  </select>
+                  <p className="text-muted-foreground text-xs">公开订阅按来源检测耗时优先；没有 90% 在线率保证。Proxy5 按网页的 50ms / 90% / 10分钟 / 快速筛选，展示指标未经本机验证。</p>
+                  <div className="flex items-center justify-between gap-2 text-sm">
+                    <span>候选 {ui.proxyPool?.entries.length ?? 0} / 5 · {ui.proxyPool?.sourceState ?? "waiting"}</span>
+                    <Button variant="outline" size="sm" disabled={ui.proxyPool?.sourceState === "fetching"}
+                      onClick={() => void refreshAutoProxyPool()}><RefreshCw /> 刷新来源</Button>
+                  </div>
+                  <p role="status" className="text-muted-foreground text-xs">{ui.proxyPool?.message ?? "等待后台代理池状态；空池时不回退直连。"}</p>
+                  {(ui.proxyPool?.entries ?? []).map((entry, index) => (
+                    <div key={entry.url} className="grid gap-1">
+                      <Input aria-label={`自动代理地址 ${index + 1}`} value={entry.url} readOnly />
+                      <span className="text-muted-foreground text-xs">{entry.source} · {entry.responded ? "收到过 HTTP 响应（不代表库存可查）" : "待验证"} · 连续连接失败 {entry.connectionFailures} 轮</span>
+                    </div>
+                  ))}
+                  <p className="text-muted-foreground text-xs">每 5 分钟刷新订阅；失效时先从缓存候选补位。网页遇安全验证会暂停自动获取，需人工处理。关闭自动池后恢复原手动代理。</p>
+                </div>
+              ) : (
               <div className="grid gap-1.5">
                 <div className="flex items-center gap-2">
                   <Label htmlFor="proxy-0" className="shrink-0">
@@ -847,6 +879,7 @@ export default function App() {
                   );
                 })}
               </div>
+              )}
             </SettingsSection>
           </SheetBody>
         </SheetContent>

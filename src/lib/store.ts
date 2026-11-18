@@ -17,6 +17,7 @@ import type {
   Category,
   CategoryOption,
   Product,
+  ProxyPoolStatus,
   Region,
   Settings,
   Store,
@@ -34,6 +35,7 @@ const MAX_LOG_LINES = 300;
 
 export interface UiState {
   rows: TargetState[];
+  proxyPool: ProxyPoolStatus | null;
   running: boolean;
   /** 非 null 表示「当前的状态不可信」，界面要挂一条持续可见的告警。 */
   trouble: Trouble | null;
@@ -76,10 +78,13 @@ const DEFAULT_SETTINGS: Settings = {
   soundEnabled: true,
   openBagOnHit: true,
   proxies: [],
+  autoProxyPoolEnabled: false,
+  autoProxyPoolSource: "publicFeeds",
 };
 
 let state: UiState = {
   rows: [],
+  proxyPool: null,
   running: false,
   trouble: null,
   pacing: null,
@@ -197,6 +202,7 @@ export function connect(): Promise<void> {
   starting = (async () => {
     unlisteners = await Promise.all([
       listen<WatcherEvent>(EVENT_CHANNEL, (e) => applyEvent(e.payload)),
+      listen<ProxyPoolStatus>("watcher://proxy-pool", (e) => update({ proxyPool: e.payload })),
       // 这条通道不只在启动时用：发提醒失败、打开购物袋失败也走这里，前缀不能写死成「启动」。
       listen<string>(NOTICE_CHANNEL, (e) => pushLog(`提示：${e.payload}`)),
     ]);
@@ -209,6 +215,7 @@ export function connect(): Promise<void> {
       invoke<boolean>("is_running"),
     ]);
     update({ regions, categories, settings, rows, running, ready: true });
+    void loadProxyPoolStatus();
     await loadCatalog(settings.locale);
     // 启动时静默查一次。查不到就算了，不打扰用户 —— 网络不通、GitHub 抽风
     // 都会走到这里，跟「有没有新版本」是两回事。
@@ -393,4 +400,20 @@ export async function installUpdate(): Promise<void> {
 
 export function dismissUpdate(): void {
   update({ update: null });
+}
+
+export async function loadProxyPoolStatus(): Promise<void> {
+  try {
+    update({ proxyPool: await invoke<ProxyPoolStatus>("get_proxy_pool_status") });
+  } catch (err) {
+    pushLog(`读取代理池状态失败：${String(err)}`);
+  }
+}
+
+export async function refreshAutoProxyPool(): Promise<void> {
+  try {
+    update({ proxyPool: await invoke<ProxyPoolStatus>("refresh_proxy_pool") });
+  } catch (err) {
+    pushLog(`刷新代理来源失败：${String(err)}`);
+  }
 }

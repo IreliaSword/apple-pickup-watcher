@@ -177,3 +177,17 @@ test("interval range is sent together and replaced with the backend-normalized s
   assert.equal(app.snapshot().settings.intervalSeconds, 60);
   assert.equal(app.snapshot().settings.intervalMaxSeconds, 90);
 });
+
+test("proxy pool refresh uses dedicated IPC and does not replace manual settings", async () => {
+  const app = setup();
+  const before = app.snapshot().settings;
+  const status = { enabled: true, sourceState: "waiting", entries: [], targetSize: 5 };
+  app.handlers.refresh_proxy_pool = () => status;
+  await app.refreshAutoProxyPool();
+  assert.equal(app.snapshot().proxyPool, status);
+  assert.equal(app.snapshot().settings, before);
+  app.handlers.refresh_proxy_pool = () => { throw new Error("source rate limit"); };
+  await app.refreshAutoProxyPool();
+  assert.equal(app.snapshot().proxyPool, status);
+  assert.match(app.snapshot().logs.at(-1), /刷新代理来源失败/);
+});

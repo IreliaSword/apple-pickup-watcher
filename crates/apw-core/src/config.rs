@@ -158,6 +158,10 @@ pub struct Settings {
     /// 切换（见 [`crate::apple::ClientConfig::proxies`]）。只保留能解析、协议为
     /// http / https / socks5 / socks5h 的地址。
     pub proxies: Vec<String>,
+    /// Automatic public proxy candidates; when enabled stock queries are proxy-only.
+    pub auto_proxy_pool_enabled: bool,
+    /// publicFeeds (default) or proxy5Browser. Manual proxies are retained.
+    pub auto_proxy_pool_source: String,
 }
 
 /// 内置地区表里的第一个 locale，作为兜底取值。
@@ -180,6 +184,8 @@ impl Default for Settings {
             sound_enabled: true,
             open_bag_on_hit: true,
             proxies: Vec::new(),
+            auto_proxy_pool_enabled: false,
+            auto_proxy_pool_source: "publicFeeds".into(),
         }
     }
 }
@@ -244,6 +250,12 @@ impl Settings {
 
         // 代理地址只留合法的：写错的留着只会让每一轮查询都撞一次「代理地址无效」。
         self.proxies = normalize_proxies(&self.proxies);
+        if !matches!(
+            self.auto_proxy_pool_source.as_str(),
+            "publicFeeds" | "proxy5Browser"
+        ) {
+            self.auto_proxy_pool_source = "publicFeeds".into();
+        }
     }
 
     /// 查询间隔范围（含两端）。每轮由调度器在范围内重新随机。
@@ -721,6 +733,8 @@ impl LegacySettings {
             open_bag_on_hit: self.open_bag_on_hit.unwrap_or(fallback.open_bag_on_hit),
             // Go 版没有代理设置，迁移过来的文件一律从空开始。
             proxies: fallback.proxies,
+            auto_proxy_pool_enabled: false,
+            auto_proxy_pool_source: "publicFeeds".into(),
         };
         settings.normalize();
         settings

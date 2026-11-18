@@ -1,0 +1,2 @@
+d1971a040b3378a47f01ad6d2262fd05d528a253c3825a3763550bf212e4301e *Apple-Pickup-Watcher-0.7.0-auto-proxy-pool-x64-setup.exe
+f61a28e0da0a94608743316b295ba2dcf8743c82084e9d13394df075d62503a7 *Apple-Pickup-Watcher-0.7.0-auto-proxy-pool-x64.msi

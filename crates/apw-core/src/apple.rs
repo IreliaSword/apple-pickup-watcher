@@ -425,6 +425,8 @@ struct Route {
     label: String,
     /// 代理线路的地址，去掉了账号密码，出错时告诉用户是哪个代理连不上；直连为 `None`。
     endpoint: Option<String>,
+    /// Exact identity, private: never serialize credentials.
+    proxy_url: Option<String>,
     http: Http,
     warm: Mutex<HashMap<String, WarmState>>,
     blocks: Mutex<BlockTracker>,
@@ -436,6 +438,7 @@ impl Route {
         Ok(Self {
             label,
             endpoint: proxy.map(redact_proxy),
+            proxy_url: proxy.map(str::to_owned),
             http: Http::build(config, proxy)?,
             warm: Mutex::new(HashMap::new()),
             blocks: Mutex::new(BlockTracker::default()),
@@ -457,7 +460,10 @@ impl std::fmt::Debug for Route {
 /// 直连排第一，之后每个代理一条线路。空白项跳过；地址不合法就整体报错，
 /// 而不是悄悄少一条线路让用户以为代理在生效。
 fn build_routes(config: &ClientConfig, proxies: &[String]) -> Result<Vec<Arc<Route>>, ApiError> {
-    let mut routes = vec![Arc::new(Route::build(config, "direct".into(), None)?)];
+    let mut routes = Vec::new();
+    if !config.proxies_only {
+        routes.push(Arc::new(Route::build(config, "direct".into(), None)?));
+    }
     let mut n = 0usize;
     for proxy in proxies {
         let proxy = proxy.trim();
@@ -613,6 +619,8 @@ pub struct ClientConfig {
     /// 换下一条继续查，见 [`AppleClient::query`]。Apple 的配额按出口 IP 计，多一条
     /// 线路就多一份配额 —— 这是 issue #37 要的。为空则只有直连。
     pub proxies: Vec<String>,
+    /// Disable direct stock requests, including when the pool is empty.
+    pub proxies_only: bool,
 }
 
 impl Default for ClientConfig {
@@ -626,6 +634,7 @@ impl Default for ClientConfig {
             transport: Transport::default_for_build(),
             budget: Budget::default(),
             proxies: Vec::new(),
+            proxies_only: false,
         }
     }
 }
@@ -634,6 +643,8 @@ impl Default for ClientConfig {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestRecord {
+    /// Monotonic completion sequence; local cooldowns do not create records.
+    pub sequence: u64,
     /// Unix 毫秒。
     pub at_ms: u64,
     /// `warm`（暖场）或 `pickup`（取货查询）。
@@ -698,6 +709,7 @@ pub struct AppleClient {
     routes: Arc<RwLock<Vec<Arc<Route>>>>,
     /// 挑线路的轮转游标：让各条线路平均分担请求，别把哪一个 IP 单独烧完。
     cursor: Arc<AtomicUsize>,
+    next_route: Arc<AtomicUsize>,
     config: ClientConfig,
     /// 上一次出站请求的时刻，用于全局限速（不分线路：突发本身就不该有）。
     last_sent: Arc<Mutex<Option<Instant>>>,
@@ -711,19 +723,69 @@ impl AppleClient {
         Ok(Self {
             routes: Arc::new(RwLock::new(routes)),
             cursor: Arc::new(AtomicUsize::new(0)),
+            next_route: Arc::new(AtomicUsize::new(config.proxies.len() + 1)),
             config,
             last_sent: Arc::new(Mutex::new(None)),
             recent: Arc::new(Mutex::new(VecDeque::with_capacity(RECENT_RECORDS))),
         })
     }
 
-    /// 换一套代理，立即生效，不用重建客户端。线路全部重建：cookie、暖场、冷却和
-    /// 预算都从头来 —— 改代理本来就意味着换了出口。地址解析不了返回错误，原线路不动。
+    /// Update manual proxy routes, preserving unchanged sessions and budgets.
     pub async fn set_proxies(&self, proxies: &[String]) -> Result<(), ApiError> {
-        let routes = build_routes(&self.config, proxies)?;
-        *self.routes.write().await = routes;
-        self.cursor.store(0, Ordering::Relaxed);
+        self.update_proxy_routes(proxies, false).await
+    }
+
+    /// Reconcile only changed routes. An empty proxy-only pool never falls back
+    /// to direct. Retained routes keep cookies, cooldown and request budget.
+    pub async fn update_proxy_routes(
+        &self,
+        proxies: &[String],
+        proxies_only: bool,
+    ) -> Result<(), ApiError> {
+        let mut current = self.routes.write().await;
+        let mut next = Vec::new();
+        if !proxies_only {
+            let direct = current.iter().find(|r| !r.is_proxy()).cloned();
+            next.push(match direct {
+                Some(route) => route,
+                None => Arc::new(Route::build(&self.config, "direct".into(), None)?),
+            });
+        }
+        let mut seen = std::collections::HashSet::new();
+        for proxy in proxies.iter().map(|p| p.trim()).filter(|p| !p.is_empty()) {
+            if !seen.insert(proxy) {
+                continue;
+            }
+            validate_proxy(proxy)?;
+            let retained = current
+                .iter()
+                .find(|r| r.proxy_url.as_deref() == Some(proxy));
+            let route = match retained {
+                Some(route) => Arc::clone(route),
+                None => Arc::new(Route::build(
+                    &self.config,
+                    format!("proxy#{}", self.next_route.fetch_add(1, Ordering::Relaxed)),
+                    Some(proxy),
+                )?),
+            };
+            next.push(route);
+        }
+        *current = next;
         Ok(())
+    }
+
+    /// Internal pool identity map. Never send these URLs to logs or notices.
+    pub async fn proxy_route_ids(&self) -> Vec<(String, String)> {
+        self.routes
+            .read()
+            .await
+            .iter()
+            .filter_map(|r| {
+                r.proxy_url
+                    .as_ref()
+                    .map(|url| (r.label.clone(), url.clone()))
+            })
+            .collect()
     }
 
     /// 当前线路的名字，直连在前：`["direct", "proxy#1", …]`。
@@ -737,9 +799,8 @@ impl AppleClient {
     }
 
     /// 直连那条线路。契约测试、诊断命令看 cookie 和协商结果时用它。
-    async fn primary(&self) -> Arc<Route> {
-        let routes = self.routes.read().await;
-        Arc::clone(routes.first().expect("至少有直连一条线路"))
+    async fn primary(&self) -> Option<Arc<Route>> {
+        self.routes.read().await.first().cloned()
     }
 
     /// 当前的请求预算（每条线路各一份）。
@@ -780,8 +841,9 @@ impl AppleClient {
         self.recent.lock().await.iter().cloned().collect()
     }
 
-    async fn push_record(&self, record: RequestRecord) {
+    async fn push_record(&self, mut record: RequestRecord) {
         let mut recent = self.recent.lock().await;
+        record.sequence = recent.back().map_or(1, |r| r.sequence + 1);
         if recent.len() >= RECENT_RECORDS {
             recent.pop_front();
         }
@@ -790,15 +852,16 @@ impl AppleClient {
 
     /// 罐里对某个地址生效的 cookie 名。
     pub async fn cookie_names_for(&self, url: &str) -> Vec<String> {
-        self.primary().await.http.cookie_names_for(url)
+        self.primary()
+            .await
+            .map_or_else(Vec::new, |route| route.http.cookie_names_for(url))
     }
 
     /// 这个地区当前攒到的 cookie，没有则返回 `None`。契约测试用；**不要打印它的值**。
     pub async fn cookies_for(&self, region: &Region) -> Option<String> {
         self.primary()
             .await
-            .http
-            .cookie_header_for(&region.pickup_message_url())
+            .and_then(|route| route.http.cookie_header_for(&region.pickup_message_url()))
     }
 
     /// 确保这个地区的 cookie 已经攒上了。
@@ -846,6 +909,7 @@ impl AppleClient {
         self.throttle(route).await;
         let started = Instant::now();
         let mut record = RequestRecord {
+            sequence: 0,
             at_ms: now_ms(),
             kind: "warm",
             transport: route.http.label(),
@@ -948,7 +1012,12 @@ impl AppleClient {
         tried: &[String],
     ) -> Result<(Arc<Route>, bool), ApiError> {
         let routes = self.routes.read().await.clone();
-        let n = routes.len().max(1);
+        if routes.is_empty() {
+            return Err(ApiError::Blocked(
+                "代理池为空，等待来源补位；不会回退直连".into(),
+            ));
+        }
+        let n = routes.len();
         let start = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
         let now = Instant::now();
 
@@ -1171,7 +1240,10 @@ impl AppleClient {
     ///
     /// 这种「配置写漏了、功能却没坏」的缺陷，只能靠一条真的去连一次的测试兜住。
     pub async fn negotiated_http_version(&self, region: &Region) -> Result<String, ApiError> {
-        let route = self.primary().await;
+        let route = self
+            .primary()
+            .await
+            .ok_or_else(|| ApiError::Blocked("代理池为空，等待可用线路".into()))?;
         self.throttle(&route).await;
         let fetched = route
             .http
@@ -1233,6 +1305,7 @@ impl AppleClient {
         } = *req;
         let started = Instant::now();
         let mut record = RequestRecord {
+            sequence: 0,
             at_ms: now_ms(),
             kind: "pickup",
             transport: route.http.label(),

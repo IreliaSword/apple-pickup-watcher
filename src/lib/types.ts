@@ -95,6 +95,8 @@ export interface Settings {
   openBagOnHit: boolean;
   /** 代理地址列表；每个代理是一条额外的出口线路，被拦时切换。可为空。 */
   proxies: string[];
+  autoProxyPoolEnabled: boolean;
+  autoProxyPoolSource: "publicFeeds" | "proxy5Browser";
 }
 
 /** 监控目标的唯一键，与 Rust 侧 Target::key 的构成保持一致。 */
@@ -235,4 +237,15 @@ export function formatTime(ms: number | null): string {
   const d = new Date(ms);
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+/** Public candidate status, not an inventory or proxy-availability verdict. */
+export interface ProxyPoolStatus {
+  enabled: boolean;
+  source: string;
+  sourceState: string;
+  message: string;
+  targetSize: number;
+  lastRefreshMs: number | null;
+  entries: { url: string; source: string; connectionFailures: number; responded: boolean }[];
 }
