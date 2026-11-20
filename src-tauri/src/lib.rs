@@ -422,12 +422,6 @@ async fn pump_events(app: AppHandle, mut events: tokio::sync::mpsc::Receiver<Eve
         // 先原样转发。前端拿到的事件流应当与引擎发出的完全一致，
         // 中间少一层可能出错的翻译。
         let _ = app.emit(EVENT_CHANNEL, &event);
-        if matches!(&event, Event::CycleComplete { .. }) {
-            let pool = app.try_state::<AppState>().map(|s| s.pool.clone());
-            if let Some(pool) = pool {
-                pool.on_round(&app).await;
-            }
-        }
 
         if let Event::RunStateChanged { running } = &event {
             auto_open_bag.on_run_state_changed(*running);
@@ -593,6 +587,7 @@ pub fn run() {
                     settings.proxies.clone()
                 },
                 proxies_only: settings.auto_proxy_pool_enabled,
+                automatic_proxy_pool: settings.auto_proxy_pool_enabled,
                 ..ClientConfig::default()
             })
             .map_err(|e| format!("构造 Apple 客户端失败：{e}"))?;

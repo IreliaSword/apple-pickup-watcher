@@ -10,7 +10,11 @@ use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock};
+
+#[path = "automatic_proxy.rs"]
+mod automatic_proxy;
+use automatic_proxy::AutomaticState;
 use tokio::time::Instant;
 
 use crate::model::{Availability, Region, UnknownReason};
@@ -621,6 +625,8 @@ pub struct ClientConfig {
     pub proxies: Vec<String>,
     /// Disable direct stock requests, including when the pool is empty.
     pub proxies_only: bool,
+    /// Desktop automatic pool: fixed slots and single-attempt fast failover.
+    pub automatic_proxy_pool: bool,
 }
 
 impl Default for ClientConfig {
@@ -635,6 +641,7 @@ impl Default for ClientConfig {
             budget: Budget::default(),
             proxies: Vec::new(),
             proxies_only: false,
+            automatic_proxy_pool: false,
         }
     }
 }
@@ -710,6 +717,10 @@ pub struct AppleClient {
     /// 挑线路的轮转游标：让各条线路平均分担请求，别把哪一个 IP 单独烧完。
     cursor: Arc<AtomicUsize>,
     next_route: Arc<AtomicUsize>,
+    automatic: Arc<Mutex<Option<AutomaticState>>>,
+    automatic_generation: Arc<AtomicUsize>,
+    automatic_query: Arc<Mutex<()>>,
+    automatic_changed: Arc<Notify>,
     config: ClientConfig,
     /// 上一次出站请求的时刻，用于全局限速（不分线路：突发本身就不该有）。
     last_sent: Arc<Mutex<Option<Instant>>>,
@@ -718,12 +729,21 @@ pub struct AppleClient {
 }
 
 impl AppleClient {
-    pub fn new(config: ClientConfig) -> Result<Self, ApiError> {
+    pub fn new(mut config: ClientConfig) -> Result<Self, ApiError> {
+        if config.automatic_proxy_pool {
+            config.proxies_only = true;
+            config.proxies.clear();
+        }
+        let automatic = config.automatic_proxy_pool.then(|| AutomaticState::new(0));
         let routes = build_routes(&config, &config.proxies)?;
         Ok(Self {
             routes: Arc::new(RwLock::new(routes)),
             cursor: Arc::new(AtomicUsize::new(0)),
             next_route: Arc::new(AtomicUsize::new(config.proxies.len() + 1)),
+            automatic: Arc::new(Mutex::new(automatic)),
+            automatic_generation: Arc::new(AtomicUsize::new(0)),
+            automatic_query: Arc::new(Mutex::new(())),
+            automatic_changed: Arc::new(Notify::new()),
             config,
             last_sent: Arc::new(Mutex::new(None)),
             recent: Arc::new(Mutex::new(VecDeque::with_capacity(RECENT_RECORDS))),
@@ -742,6 +762,7 @@ impl AppleClient {
         proxies: &[String],
         proxies_only: bool,
     ) -> Result<(), ApiError> {
+        let mut automatic = self.automatic.lock().await;
         let mut current = self.routes.write().await;
         let mut next = Vec::new();
         if !proxies_only {
@@ -771,6 +792,8 @@ impl AppleClient {
             next.push(route);
         }
         *current = next;
+        *automatic = None;
+        self.automatic_generation.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1108,6 +1131,20 @@ impl AppleClient {
         if store_number.is_empty() {
             return Err(ApiError::Transport("门店编号为空".into()));
         }
+        if self.automatic.lock().await.is_some() {
+            return self
+                .query_automatic(
+                    region,
+                    PickupScope::Store(store_number.to_string()),
+                    parts,
+                    |body| {
+                        let store = parse_pickup_message(body, store_number)?;
+                        automatic_proxy::validate_result(std::slice::from_ref(&store), parts)?;
+                        Ok(store)
+                    },
+                )
+                .await;
+        }
         let body = self
             .query(region, PickupScope::Store(store_number.to_string()), parts)
             .await?;
@@ -1127,6 +1164,20 @@ impl AppleClient {
     ) -> Result<Vec<StoreAvailability>, ApiError> {
         if location.trim().is_empty() {
             return Err(ApiError::Transport("查询地点为空".into()));
+        }
+        if self.automatic.lock().await.is_some() {
+            return self
+                .query_automatic(
+                    region,
+                    PickupScope::Nearby(location.to_string()),
+                    parts,
+                    |body| {
+                        let stores = parse_pickup_stores(body)?;
+                        automatic_proxy::validate_result(&stores, parts)?;
+                        Ok(stores)
+                    },
+                )
+                .await;
         }
         let body = self
             .query(region, PickupScope::Nearby(location.to_string()), parts)

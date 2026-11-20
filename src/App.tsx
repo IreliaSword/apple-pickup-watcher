@@ -793,7 +793,7 @@ export default function App() {
                 <Switch id="auto-proxy-pool" checked={Boolean(ui.settings.autoProxyPoolEnabled)}
                   onCheckedChange={(enabled) => void saveSettings({ ...ui.settings, autoProxyPoolEnabled: enabled })} />
               </div>
-              <p className="text-muted-foreground text-xs">目标保持 5 个候选，不保证始终有 5 个可用。连续两轮实际请求出现连接失败或 HTTP 541 才淘汰补位；本地冷却等待不计数。免费代理不用于登录或下单。</p>
+              <p className="text-muted-foreground text-xs">目标保持 5 个候选，不保证始终有 5 个可用。按 A→B→C→D→E 固定槽位轮转；实际查询失败（含连接失败、超时、HTTP 541）立即淘汰并尝试下一条，后台补位不阻塞查询；成功后才等待设定间隔。保留全局限速与空池退避。免费代理不用于登录或下单。</p>
               {ui.settings.autoProxyPoolEnabled ? (
                 <div className="grid gap-2">
                   <Label htmlFor="auto-proxy-source">候选来源</Label>
@@ -810,12 +810,16 @@ export default function App() {
                       onClick={() => void refreshAutoProxyPool()}><RefreshCw /> 更新订阅</Button>
                   </div>
                   <p role="status" className="text-muted-foreground text-xs">{ui.proxyPool?.message ?? "等待后台代理池状态；空池时不回退直连。"}</p>
-                  {(ui.proxyPool?.entries ?? []).map((entry, index) => (
-                    <div key={entry.url} className="grid gap-1">
-                      <Input aria-label={`自动代理地址 ${index + 1}`} value={entry.url} readOnly />
-                      <span className="text-muted-foreground text-xs">{entry.source} · {entry.responded ? "收到过 HTTP 响应（不代表库存可查）" : "待验证"} · 连续失败 {entry.failureRounds} 轮（连接失败 / HTTP 541）</span>
-                    </div>
-                  ))}
+                  {Array.from({ length: 5 }, (_, slot) => {
+                    const label = String.fromCharCode(65 + slot);
+                    const entry = ui.proxyPool?.entries.find((candidate) => candidate.slot === slot);
+                    return (
+                      <div key={slot} className="grid gap-1">
+                        <Input aria-label={`自动代理地址 ${label}`} value={entry?.url ?? ""} placeholder={`槽位 ${label}：等待补位`} readOnly />
+                        <span className="text-muted-foreground text-xs" data-proxy-slot={label}>槽位 {label} · {entry ? `${entry.source} · ${entry.responded ? "查询成功过（不代表当前有货）" : "待验证"}` : "等待后台补位"}</span>
+                      </div>
+                    );
+                  })}
                   <p className="text-muted-foreground text-xs">每 5 分钟更新订阅；只更新备用候选和补足空位，不强制更换已有代理。失效时先从缓存候选补位。网页遇安全验证会暂停自动获取，需人工处理。关闭自动池后恢复原手动代理。</p>
                 </div>
               ) : (

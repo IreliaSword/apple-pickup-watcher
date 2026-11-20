@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use apw_core::apple::AppleClient;
-use apw_core::proxy_pool::{Candidate, PoolEntry, ProxyPool, TARGET_SIZE};
+use apw_core::proxy_pool::{Candidate, PoolEntry, TARGET_SIZE};
 use apw_core::proxy_sources::fetch_public_feeds;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
@@ -27,7 +27,6 @@ pub struct PoolStatus {
 }
 
 struct State {
-    pool: ProxyPool,
     candidates: Vec<Candidate>,
     status: PoolStatus,
     generation: u64,
@@ -54,7 +53,6 @@ impl PoolService {
     pub fn new(client: AppleClient, enabled: bool, source: String, profile: PathBuf) -> Self {
         Self {
             inner: Arc::new(Mutex::new(State {
-                pool: ProxyPool::default(),
                 candidates: vec![],
                 generation: 0,
                 next_fetch: 0,
@@ -91,12 +89,15 @@ impl PoolService {
         if changed {
             // Remove direct immediately before enabling. Manual addresses remain
             // in Settings and are restored when the feature is disabled.
-            self.client
-                .update_proxy_routes(if enabled { &[] } else { manual }, enabled)
-                .await
-                .map_err(|_| "代理模式切换失败".to_string())?;
+            if enabled {
+                self.client.enable_automatic_pool().await;
+            } else {
+                self.client
+                    .set_proxies(manual)
+                    .await
+                    .map_err(|_| "代理模式切换失败".to_string())?;
+            }
             state.generation += 1;
-            state.pool = ProxyPool::default();
             state.candidates.clear();
             state.blocked = false;
             state.next_fetch = 0;
@@ -150,39 +151,43 @@ impl PoolService {
         Ok(status)
     }
 
-    pub async fn on_round(&self, app: &AppHandle) {
-        if !self.inner.lock().await.status.enabled {
-            return;
-        }
-        let records = self.client.recent_requests().await;
-        let routes = self.client.proxy_route_ids().await;
+    /// Runs independently of watcher rounds and source downloads. Eviction is
+    /// already applied by the client before it tries the next slot.
+    async fn maintain(&self) -> Option<PoolStatus> {
         let mut state = self.inner.lock().await;
         if !state.status.enabled {
-            return;
+            return None;
         }
-        let mut proposed = state.pool.clone();
-        let changed = proposed.observe_round(&records, &routes, now_ms());
-        if changed {
-            let candidates = state.candidates.clone();
-            proposed.replenish(candidates, now_ms());
-            if self
-                .client
-                .update_proxy_routes(&proposed.urls(), true)
-                .await
-                .is_err()
-            {
-                state.status.message = "候选线路装配失败，未重置其余线路。".into();
-                let _ = app.emit(EVENT, &state.status);
-                return;
-            }
+        let candidates = state.candidates.clone();
+        if self
+            .client
+            .replenish_automatic_pool(candidates)
+            .await
+            .is_err()
+        {
+            state.status.message = "候选线路装配失败，保留其余线路，稍后补位。".into();
         }
-        state.pool = proposed;
-        state.status.entries = state.pool.entries().to_vec();
-        let _ = app.emit(EVENT, &state.status);
+        let entries = self
+            .client
+            .automatic_pool_entries()
+            .await
+            .unwrap_or_default();
+        if entries != state.status.entries {
+            state.status.entries = entries;
+            return Some(state.status.clone());
+        }
+        None
+    }
+
+    async fn maintain_and_emit(&self, app: &AppHandle) {
+        if let Some(status) = self.maintain().await {
+            let _ = app.emit(EVENT, &status);
+        }
     }
 
     pub async fn run(self, app: AppHandle) {
         loop {
+            self.maintain_and_emit(&app).await;
             let job = {
                 let mut state = self.inner.lock().await;
                 if state.status.enabled && !state.blocked && now_ms() >= state.next_fetch {
@@ -195,20 +200,32 @@ impl PoolService {
                 }
             };
             if let Some((generation, source)) = job {
-                let result = if source == "proxy5Browser" {
-                    let profile = self.profile.clone();
-                    match tokio::task::spawn_blocking(move || read_browser(profile)).await {
-                        Ok(result) => result,
-                        Err(_) => Err("浏览器来源任务失败".into()),
+                let fetch = async {
+                    if source == "proxy5Browser" {
+                        let profile = self.profile.clone();
+                        match tokio::task::spawn_blocking(move || read_browser(profile)).await {
+                            Ok(result) => result,
+                            Err(_) => Err("浏览器来源任务失败".into()),
+                        }
+                    } else {
+                        fetch_public_feeds()
+                            .await
+                            .map(|(candidates, message)| SourceResult {
+                                state: "ready".into(),
+                                message,
+                                candidates,
+                            })
                     }
-                } else {
-                    fetch_public_feeds()
-                        .await
-                        .map(|(candidates, message)| SourceResult {
-                            state: "ready".into(),
-                            message,
-                            candidates,
-                        })
+                };
+                tokio::pin!(fetch);
+                // A slow subscription/browser refresh must not delay cached
+                // replacements while stock queries try the remaining slots.
+                let result = loop {
+                    tokio::select! {
+                        result = &mut fetch => break result,
+                        _ = self.client.automatic_pool_changed() => self.maintain_and_emit(&app).await,
+                        _ = self.wake.notified() => self.maintain_and_emit(&app).await,
+                    }
                 };
                 let mut state = self.inner.lock().await;
                 if state.generation == generation && state.status.enabled {
@@ -220,20 +237,20 @@ impl PoolService {
                             state.status.message = result.message;
                             state.candidates = result.candidates;
                             let candidates = state.candidates.clone();
-                            let mut proposed = state.pool.clone();
-                            proposed.replenish(candidates, now_ms());
                             if self
                                 .client
-                                .update_proxy_routes(&proposed.urls(), true)
+                                .replenish_automatic_pool(candidates)
                                 .await
                                 .is_err()
                             {
                                 state.status.source_state = "error".into();
-                                state.status.message = "候选线路装配失败，保留原线路。".into();
-                            } else {
-                                state.pool = proposed;
+                                state.status.message = "候选线路装配失败，保留其余线路。".into();
                             }
-                            state.status.entries = state.pool.entries().to_vec();
+                            state.status.entries = self
+                                .client
+                                .automatic_pool_entries()
+                                .await
+                                .unwrap_or_default();
                         }
                         Err(message) => {
                             state.status.source_state = "error".into();
@@ -247,6 +264,7 @@ impl PoolService {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(15)) => {},
                 _ = self.wake.notified() => {},
+                _ = self.client.automatic_pool_changed() => {},
             }
         }
     }
@@ -328,5 +346,49 @@ mod tests {
         assert_eq!(enabled.refresh().await.unwrap().source_state, "waiting");
         assert!(!enabled.inner.lock().await.blocked);
         assert!(enabled.status().await.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cached_candidates_fill_slots_even_while_source_is_fetching_or_blocked() {
+        let service = service(true);
+        service.client.enable_automatic_pool().await;
+        {
+            let mut state = service.inner.lock().await;
+            state.status.source_state = "fetching".into();
+            state.candidates = (1..=6)
+                .map(|n| Candidate {
+                    url: format!("http://8.8.8.{n}:8080"),
+                    source: "offline-no-connect".into(),
+                    uptime: None,
+                    latency_ms: None,
+                })
+                .collect();
+        }
+        let status = service
+            .maintain()
+            .await
+            .expect("cached candidates installed without source IO");
+        assert_eq!(status.source_state, "fetching");
+        assert_eq!(status.entries.len(), 5);
+        assert_eq!(
+            status.entries.iter().map(|e| e.slot).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4]
+        );
+        assert!(
+            service.maintain().await.is_none(),
+            "unchanged status is not re-emitted"
+        );
+        service.client.enable_automatic_pool().await;
+        {
+            let mut state = service.inner.lock().await;
+            state.status.source_state = "blocked".into();
+            state.blocked = true;
+            state.status.entries.clear();
+        }
+        assert_eq!(service.maintain().await.unwrap().entries.len(), 5);
+        assert!(
+            service.inner.lock().await.blocked,
+            "cache maintenance must not restart a blocked source"
+        );
     }
 }

@@ -1,5 +1,4 @@
 //! Bounded candidate pool. No network IO or inventory decisions here.
-use crate::apple::RequestRecord;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -61,13 +60,13 @@ pub fn valid_public_proxy(raw: &str) -> bool {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PoolEntry {
+    /// Stable zero-based A..E position. Removing B never moves C into B.
+    pub slot: usize,
     pub url: String,
     pub source: String,
-    /// Consecutive actual rounds ending in transport failure or HTTP 541.
-    pub failure_rounds: u8,
     /// A response is not evidence of available stock.
     pub responded: bool,
 }
@@ -76,18 +75,14 @@ pub struct PoolEntry {
 pub struct ProxyPool {
     entries: Vec<PoolEntry>,
     rejected: HashMap<String, u64>,
-    cursor: u64,
 }
 
 impl ProxyPool {
     pub fn entries(&self) -> &[PoolEntry] {
         &self.entries
     }
-    pub fn urls(&self) -> Vec<String> {
-        self.entries.iter().map(|e| e.url.clone()).collect()
-    }
 
-    /// Fill vacancies only; never reset healthy entries during a feed refresh.
+    /// Fill vacant slots only, preserving the order and state of other entries.
     pub fn replenish(&mut self, mut candidates: Vec<Candidate>, now_ms: u64) {
         self.rejected.retain(|_, until| *until > now_ms);
         candidates.retain(|c| {
@@ -118,9 +113,11 @@ impl ProxyPool {
             })
             .collect();
         for candidate in candidates {
-            if self.entries.len() >= TARGET_SIZE {
+            let Some(slot) =
+                (0..TARGET_SIZE).find(|slot| !self.entries.iter().any(|e| e.slot == *slot))
+            else {
                 break;
-            }
+            };
             if self.rejected.contains_key(&candidate.url) {
                 continue;
             }
@@ -132,273 +129,167 @@ impl ProxyPool {
                 continue;
             }
             self.entries.push(PoolEntry {
+                slot,
                 url: candidate.url,
                 source: candidate.source,
-                failure_rounds: 0,
                 responded: false,
             });
         }
+        self.entries.sort_by_key(|e| e.slot);
     }
 
-    /// Called once per completed watcher round. The last actual pickup result
-    /// counts once: transport failure or HTTP 541 increments the streak; other
-    /// HTTP responses reset it. Local cooldowns cannot advance the streak.
-    pub fn observe_round(
-        &mut self,
-        records: &[RequestRecord],
-        routes: &[(String, String)],
-        now_ms: u64,
-    ) -> bool {
-        let mut last = HashMap::<&str, &RequestRecord>::new();
-        for record in records.iter().filter(|r| r.sequence > self.cursor) {
-            if record.kind != "pickup" {
-                continue;
-            }
-            match last.get(record.route.as_str()) {
-                Some(old) if old.sequence >= record.sequence => {}
-                _ => {
-                    last.insert(&record.route, record);
-                }
-            }
-        }
-        self.cursor = records
-            .iter()
-            .map(|r| r.sequence)
-            .max()
-            .unwrap_or(self.cursor)
-            .max(self.cursor);
-        for (label, url) in routes {
-            let Some(record) = last.get(label.as_str()) else {
-                continue;
-            };
-            let Some(entry) = self.entries.iter_mut().find(|e| &e.url == url) else {
-                continue;
-            };
-            match record.status {
-                Some(541) => {
-                    entry.failure_rounds = entry.failure_rounds.saturating_add(1);
-                    entry.responded = true;
-                }
-                Some(_) => {
-                    entry.failure_rounds = 0;
-                    entry.responded = true;
-                }
-                None if record.outcome == "transport" => {
-                    entry.failure_rounds = entry.failure_rounds.saturating_add(1);
-                    entry.responded = false;
-                }
-                None => {}
-            }
-        }
+    /// A single actual failed query retires its endpoint. Local waits never call this.
+    pub fn evict(&mut self, url: &str, now_ms: u64) -> bool {
         let before = self.entries.len();
-        self.entries.retain(|entry| {
-            if entry.failure_rounds < 2 {
-                return true;
-            }
-            self.rejected
-                .insert(entry.url.clone(), now_ms.saturating_add(REJECT_FOR_MS));
-            false
-        });
-        self.entries.len() != before
+        self.entries.retain(|entry| entry.url != url);
+        if self.entries.len() == before {
+            return false;
+        }
+        self.rejected
+            .insert(url.to_string(), now_ms.saturating_add(REJECT_FOR_MS));
+        true
+    }
+
+    pub fn mark_responded(&mut self, url: &str) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.url == url) {
+            entry.responded = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fixture(urls: &[String]) -> Self {
+        assert!(urls.len() <= TARGET_SIZE);
+        Self {
+            entries: urls
+                .iter()
+                .enumerate()
+                .map(|(slot, url)| PoolEntry {
+                    slot,
+                    url: url.clone(),
+                    source: "offline-fixture".into(),
+                    responded: false,
+                })
+                .collect(),
+            rejected: HashMap::new(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn candidate(n: u8, uptime: f64) -> Candidate {
+
+    fn candidate(n: u8) -> Candidate {
         Candidate {
             url: format!("http://8.8.8.{n}:8080"),
-            source: "offline-fixture".into(),
-            uptime: Some(uptime),
-            latency_ms: Some(20.0),
+            source: "fixture".into(),
+            uptime: None,
+            latency_ms: Some(f64::from(n)),
         }
     }
-    fn record(sequence: u64, route: &str, status: Option<u16>) -> RequestRecord {
-        RequestRecord {
-            sequence,
-            at_ms: 0,
-            kind: "pickup",
-            transport: "rustls",
-            route: route.into(),
-            locale: "ja_JP".into(),
-            store: None,
-            location: None,
-            parts: 1,
-            status,
-            http_version: None,
-            duration_ms: 1,
-            outcome: if status.is_some() {
-                "blocked"
-            } else {
-                "transport"
-            }
-            .into(),
-            cookies_sent: vec![],
-            cookies_after: vec![],
-            final_url: None,
-        }
-    }
+
     #[test]
-    fn filters_untrusted_endpoints() {
-        for url in [
+    fn replacements_keep_the_vacant_slot_and_other_states() {
+        let mut pool = ProxyPool::default();
+        pool.replenish((1..=9).map(candidate).collect(), 0);
+        assert_eq!(
+            pool.entries().iter().map(|e| e.slot).collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4]
+        );
+        let old = pool.entries()[1].url.clone();
+        pool.mark_responded(&pool.entries()[2].url.clone());
+        let c = pool.entries()[2].clone();
+        assert!(pool.evict(&old, 1));
+        assert!(!pool.evict(&old, 1));
+        assert_eq!(pool.entries()[1], c);
+        pool.replenish((1..=9).map(candidate).collect(), 2);
+        assert_eq!(pool.entries()[1].slot, 1);
+        assert_eq!(pool.entries()[1].url, candidate(6).url);
+        assert!(!pool.entries()[1].responded);
+        assert_eq!(pool.entries()[2], c);
+        let snapshot = pool.entries().to_vec();
+        pool.replenish((10..=20).map(candidate).collect(), 3);
+        assert_eq!(pool.entries(), snapshot);
+    }
+
+    #[test]
+    fn rejected_endpoint_stays_out_for_thirty_minutes() {
+        let mut pool = ProxyPool::default();
+        pool.replenish(vec![candidate(1)], 0);
+        pool.evict(&candidate(1).url, 100);
+        pool.replenish(vec![candidate(1)], REJECT_FOR_MS + 99);
+        assert!(pool.entries().is_empty());
+        pool.replenish(vec![candidate(1)], REJECT_FOR_MS + 100);
+        assert_eq!(pool.entries().len(), 1);
+    }
+
+    #[test]
+    fn ordering_deduplication_and_invalid_metrics_are_preserved() {
+        let mut candidates = vec![candidate(1), candidate(2), candidate(3), candidate(4)];
+        candidates[1].uptime = Some(99.0);
+        candidates[2].latency_ms = Some(f64::NAN);
+        candidates[3].uptime = Some(101.0);
+        candidates.push(Candidate {
+            url: "socks5h://8.8.8.2:1080".into(),
+            ..candidate(2)
+        });
+        candidates.push(Candidate {
+            uptime: Some(f64::INFINITY),
+            ..candidate(5)
+        });
+        candidates.push(Candidate {
+            latency_ms: Some(-1.0),
+            ..candidate(6)
+        });
+        let mut pool = ProxyPool::default();
+        pool.replenish(candidates, 0);
+        assert_eq!(pool.entries().len(), 2);
+        assert_eq!(pool.entries()[0].url, candidate(2).url);
+        assert_eq!(pool.entries()[1].url, candidate(1).url);
+    }
+
+    #[test]
+    fn untrusted_candidates_cannot_inject_credentials_or_local_endpoints() {
+        for raw in [
             "http://127.0.0.1:80",
-            "http://10.0.0.1:80",
+            "http://10.1.1.1:80",
+            "http://192.168.1.1:80",
+            "http://172.16.1.1:80",
             "http://169.254.169.254:80",
-            "http://100.64.0.1:80",
-            "http://user:pass@8.8.8.8:80",
-            "http://localhost:80",
-            "http://8.8.8.8:80/path",
-            "socks4://8.8.8.8:1080",
+            "http://100.64.1.1:80",
+            "http://198.18.1.1:80",
+            "http://203.0.113.1:80",
+            "http://224.1.1.1:80",
             "http://[::1]:80",
+            "http://[fc00::1]:80",
+            "http://[2001:db8::1]:80",
             "http://[::ffff:127.0.0.1]:80",
+            "http://example.com:80",
+            "http://user:pass@8.8.8.8:80",
+            "http://8.8.8.8:80/path",
+            "http://8.8.8.8:80/?secret=1",
+            "http://8.8.8.8:80/#fragment",
+            "ftp://8.8.8.8:80",
+            "http://8.8.8.8:0",
         ] {
-            assert!(!valid_public_proxy(url), "{url}");
+            assert!(!valid_public_proxy(raw), "must reject {raw}");
         }
-        assert!(valid_public_proxy("socks5h://8.8.8.8:1080"));
-        assert!(valid_public_proxy("http://8.8.8.8:80"));
-        assert!(valid_public_proxy("https://8.8.8.8:443"));
-    }
-    #[test]
-    fn best_uptime_first_and_five_distinct_hosts() {
+        for raw in [
+            "http://8.8.8.8:8080",
+            "https://1.1.1.1:443",
+            "socks5://9.9.9.9:1080",
+            "socks5h://[2606:4700:4700::1111]:1080",
+        ] {
+            assert!(valid_public_proxy(raw), "must accept {raw}");
+        }
         let mut pool = ProxyPool::default();
         pool.replenish(
-            (1..=8).map(|n| candidate(n, f64::from(n) + 90.0)).collect(),
+            vec![Candidate {
+                url: "http://localhost:8080".into(),
+                ..candidate(1)
+            }],
             0,
         );
-        assert_eq!(pool.entries.len(), 5);
-        assert_eq!(pool.entries[0].url, candidate(8, 98.0).url);
-    }
-    #[test]
-    fn retries_one_round_count_once_and_only_replace_bad_entry() {
-        let mut pool = ProxyPool::default();
-        let all: Vec<_> = (1..=6).map(|n| candidate(n, 100.0)).collect();
-        pool.replenish(all.clone(), 0);
-        let routes = vec![("proxy#1".into(), all[0].url.clone())];
-        assert!(!pool.observe_round(
-            &[record(1, "proxy#1", None), record(2, "proxy#1", None)],
-            &routes,
-            1
-        ));
-        assert_eq!(pool.entries[0].failure_rounds, 1);
-        assert!(!pool.observe_round(&[record(2, "proxy#1", None)], &routes, 2));
-        assert!(pool.observe_round(&[record(3, "proxy#1", None)], &routes, 3));
-        pool.replenish(all.clone(), 4);
-        assert_eq!(
-            pool.urls(),
-            all[1..].iter().map(|x| x.url.clone()).collect::<Vec<_>>()
-        );
-    }
-    #[test]
-    fn two_http_541_rounds_replace_only_the_failed_route() {
-        let mut pool = ProxyPool::default();
-        let all: Vec<_> = (1..=6).map(|n| candidate(n, 100.0)).collect();
-        pool.replenish(all.clone(), 0);
-        let routes = vec![("p".into(), all[0].url.clone())];
-        let first_round = [record(1, "p", Some(541)), record(2, "p", Some(541))];
-        assert!(!pool.observe_round(&first_round, &routes, 1));
-        assert_eq!(pool.entries[0].failure_rounds, 1);
-        assert!(pool.entries[0].responded);
-        // Replayed records and a local cooldown do not create another failure.
-        assert!(!pool.observe_round(&first_round, &routes, 2));
-        assert!(!pool.observe_round(&[], &routes, 3));
-        assert_eq!(pool.entries[0].failure_rounds, 1);
-        let retained = serde_json::to_value(&pool.entries[1..]).unwrap();
-        assert!(pool.observe_round(&[record(3, "p", Some(541))], &routes, 4));
-        pool.replenish(all.clone(), 5);
-        assert_eq!(pool.entries.len(), TARGET_SIZE);
-        assert_eq!(serde_json::to_value(&pool.entries[..4]).unwrap(), retained);
-        assert_eq!(pool.entries[4].url, all[5].url);
-        assert!(!pool.urls().contains(&all[0].url));
-    }
-    #[test]
-    fn transport_and_http_541_share_the_two_round_threshold() {
-        for statuses in [[None, Some(541)], [Some(541), None]] {
-            let mut pool = ProxyPool::default();
-            let c = candidate(1, 100.0);
-            pool.replenish(vec![c.clone()], 0);
-            let routes = vec![("p".into(), c.url)];
-            assert!(!pool.observe_round(&[record(1, "p", statuses[0])], &routes, 1));
-            assert_eq!(pool.entries[0].failure_rounds, 1);
-            assert!(pool.observe_round(&[record(2, "p", statuses[1])], &routes, 2));
-            assert!(pool.entries.is_empty());
-        }
-    }
-    #[test]
-    fn other_http_responses_reset_the_failure_streak() {
-        for status in [200, 403, 429, 500] {
-            let mut pool = ProxyPool::default();
-            let c = candidate(1, 100.0);
-            pool.replenish(vec![c.clone()], 0);
-            let routes = vec![("p".into(), c.url)];
-            pool.observe_round(&[record(1, "p", Some(541))], &routes, 1);
-            assert!(!pool.observe_round(&[record(2, "p", Some(status))], &routes, 2));
-            assert_eq!(pool.entries[0].failure_rounds, 0);
-            assert!(pool.entries[0].responded);
-            assert!(!pool.observe_round(&[record(3, "p", Some(541))], &routes, 3));
-            assert_eq!(pool.entries[0].failure_rounds, 1);
-        }
-    }
-    #[test]
-    fn last_actual_pickup_result_determines_each_round() {
-        let mut pool = ProxyPool::default();
-        let c = candidate(1, 100.0);
-        pool.replenish(vec![c.clone()], 0);
-        let routes = vec![("p".into(), c.url)];
-        let recovered_round = [record(1, "p", Some(541)), record(2, "p", Some(200))];
-        assert!(!pool.observe_round(&recovered_round, &routes, 1));
-        assert_eq!(pool.entries[0].failure_rounds, 0);
-        let blocked_round = [record(3, "p", Some(200)), record(4, "p", Some(541))];
-        assert!(!pool.observe_round(&blocked_round, &routes, 2));
-        assert_eq!(pool.entries[0].failure_rounds, 1);
-        assert!(pool.observe_round(&[record(5, "p", Some(541))], &routes, 3));
-    }
-    #[test]
-    fn http_541_eviction_excludes_the_address_for_thirty_minutes() {
-        let mut pool = ProxyPool::default();
-        let c = candidate(1, 100.0);
-        pool.replenish(vec![c.clone()], 0);
-        let routes = vec![("p".into(), c.url.clone())];
-        pool.observe_round(&[record(1, "p", Some(541))], &routes, 1);
-        assert!(pool.observe_round(&[record(2, "p", Some(541))], &routes, 2));
-        pool.replenish(vec![c.clone()], 2 + REJECT_FOR_MS - 1);
-        assert!(pool.entries.is_empty());
-        pool.replenish(vec![c.clone()], 2 + REJECT_FOR_MS);
-        assert_eq!(pool.urls(), vec![c.url]);
-        assert_eq!(pool.entries[0].failure_rounds, 0);
-    }
-    #[test]
-    fn status_serializes_the_combined_failure_round_count() {
-        let mut pool = ProxyPool::default();
-        let c = candidate(1, 100.0);
-        pool.replenish(vec![c.clone()], 0);
-        pool.observe_round(&[record(1, "p", Some(541))], &[("p".into(), c.url)], 1);
-        let entry = serde_json::to_value(&pool.entries[0]).unwrap();
-        assert_eq!(entry["failureRounds"], 1);
-        assert_eq!(entry["responded"], true);
-        assert!(entry.get("connectionFailures").is_none());
-    }
-    #[test]
-    fn warm_requests_and_direct_do_not_evict() {
-        let mut pool = ProxyPool::default();
-        let c = candidate(1, 100.0);
-        pool.replenish(vec![c.clone()], 0);
-        let mut warm = record(1, "p", None);
-        warm.kind = "warm";
-        pool.observe_round(
-            &[warm, record(2, "direct", None)],
-            &[("p".into(), c.url)],
-            1,
-        );
-        assert_eq!(pool.entries[0].failure_rounds, 0);
-    }
-    #[test]
-    fn no_fabricated_fill_and_healthy_entries_stay() {
-        let mut pool = ProxyPool::default();
-        let c = candidate(1, 90.0);
-        pool.replenish(vec![c.clone()], 0);
-        pool.replenish(vec![candidate(2, 100.0)], 1);
-        assert_eq!(pool.entries.len(), 2);
-        assert_eq!(pool.entries[0].url, c.url);
+        assert!(pool.entries().is_empty());
     }
 }

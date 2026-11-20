@@ -96,8 +96,7 @@ function renderApp() {
     autoRows: () => all((element) => /^自动代理地址 /.test(element?.props?.["aria-label"] ?? "")),
     autoRefresh: () => control((element) => element.type === "Button" &&
       Array.isArray(element.props.children) && element.props.children.includes(" 更新订阅")),
-    autoFailureLabels: () => all((element) => element.type === "span" &&
-      Array.isArray(element.props.children) && element.props.children.includes(" · 连续失败 ")),
+    autoSlotLabels: () => all((element) => element.type === "span" && element.props["data-proxy-slot"]),
     intervalInput: (edge) => control((element) => element?.props?.id === `interval-${edge}`),
     intervalGroup: () => control((element) => element?.type === "div" &&
       typeof element.props?.onBlur === "function"),
@@ -450,7 +449,7 @@ test("the add panel says how many of the picked combinations are already being w
   assert.equal(app.addButton().disabled, true, "全都在列表里时没有可加的，按钮不该亮着");
 });
 
-test("automatic proxy mode retains manual addresses and renders only candidate rows", async () => {
+test("automatic proxy mode retains manual addresses and renders stable read-only slots", async () => {
   const app = renderApp();
   app.state.settings.proxies = ["http://127.0.0.1:1080"];
   app.autoPool().onCheckedChange(true);
@@ -458,8 +457,8 @@ test("automatic proxy mode retains manual addresses and renders only candidate r
   assert.equal(app.state.settings.autoProxyPoolEnabled, true);
   assert.deepEqual(app.state.settings.proxies, ["http://127.0.0.1:1080"]);
   assert.equal(app.proxyValues().length, 0);
-  app.state.proxyPool = { entries: [{ url: "http://8.8.8.8:8080", source: "fixture", failureRounds: 0, responded: false }], sourceState: "ready", message: "unverified" };
-  assert.equal(app.autoRows().length, 1);
+  app.state.proxyPool = { entries: [{ url: "http://8.8.8.8:8080", source: "fixture", slot: 0, responded: false }], sourceState: "ready", message: "unverified" };
+  assert.equal(app.autoRows().length, 5);
   assert.equal(app.autoRows()[0].props.readOnly, true);
   app.autoSource().onChange({ target: { value: "proxy5Browser" } });
   await new Promise(setImmediate);
@@ -469,20 +468,24 @@ test("automatic proxy mode retains manual addresses and renders only candidate r
   assert.deepEqual(app.proxyValues(), ["http://127.0.0.1:1080"]);
 });
 
-test("update subscription button keeps refresh action and displays combined failure rounds", async () => {
+test("subscription refresh keeps its action and vacant slots never shift the next address", async () => {
   const app = renderApp();
   app.state.settings.autoProxyPoolEnabled = true;
   app.state.proxyPool = {
-    entries: [{ url: "http://8.8.8.8:8080", source: "fixture", failureRounds: 1, responded: true }],
+    entries: [{ slot: 2, url: "http://8.8.8.8:8080", source: "fixture", responded: true }],
     sourceState: "ready", message: "unverified",
   };
   assert.equal(app.autoRefresh().disabled, false);
   await app.autoRefresh().onClick();
   assert.equal(app.poolRefreshes.length, 1);
-  const failureLabel = app.autoFailureLabels()[0].props.children;
-  assert.ok(failureLabel.includes(1));
-  assert.ok(failureLabel.includes(" 轮（连接失败 / HTTP 541）"));
-  assert.ok(failureLabel.some((text) => typeof text === "string" && text.includes("收到过 HTTP 响应")));
+  assert.deepEqual(app.autoRows().map((row) => row.props["aria-label"]),
+    ["A", "B", "C", "D", "E"].map((slot) => `自动代理地址 ${slot}`));
+  assert.deepEqual(app.autoRows().map((row) => row.props.value), ["", "", "http://8.8.8.8:8080", "", ""]);
+  assert.ok(app.autoSlotLabels()[1].props.children.includes("等待后台补位"));
+  assert.ok(app.autoSlotLabels()[2].props.children.some((text) => typeof text === "string" && text.includes("查询成功过")));
+  app.state.proxyPool.entries.push({ slot: 1, url: "http://9.9.9.9:8080", source: "replacement", responded: false });
+  assert.equal(app.autoRows()[1].props.value, "http://9.9.9.9:8080");
+  assert.equal(app.autoRows()[2].props.value, "http://8.8.8.8:8080");
   app.state.proxyPool.sourceState = "fetching";
   assert.equal(app.autoRefresh().disabled, true);
 });
