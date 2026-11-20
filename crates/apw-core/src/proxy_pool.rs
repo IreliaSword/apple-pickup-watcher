@@ -66,7 +66,8 @@ pub fn valid_public_proxy(raw: &str) -> bool {
 pub struct PoolEntry {
     pub url: String,
     pub source: String,
-    pub connection_failures: u8,
+    /// Consecutive actual rounds ending in transport failure or HTTP 541.
+    pub failure_rounds: u8,
     /// A response is not evidence of available stock.
     pub responded: bool,
 }
@@ -133,14 +134,15 @@ impl ProxyPool {
             self.entries.push(PoolEntry {
                 url: candidate.url,
                 source: candidate.source,
-                connection_failures: 0,
+                failure_rounds: 0,
                 responded: false,
             });
         }
     }
 
-    /// Called once per completed watcher round. Retries/parallel requests only
-    /// count once. Local cooldowns have no records and cannot evict a proxy.
+    /// Called once per completed watcher round. The last actual pickup result
+    /// counts once: transport failure or HTTP 541 increments the streak; other
+    /// HTTP responses reset it. Local cooldowns cannot advance the streak.
     pub fn observe_round(
         &mut self,
         records: &[RequestRecord],
@@ -172,17 +174,25 @@ impl ProxyPool {
             let Some(entry) = self.entries.iter_mut().find(|e| &e.url == url) else {
                 continue;
             };
-            if record.status.is_some() {
-                entry.connection_failures = 0;
-                entry.responded = true;
-            } else if record.outcome == "transport" {
-                entry.connection_failures = entry.connection_failures.saturating_add(1);
-                entry.responded = false;
+            match record.status {
+                Some(541) => {
+                    entry.failure_rounds = entry.failure_rounds.saturating_add(1);
+                    entry.responded = true;
+                }
+                Some(_) => {
+                    entry.failure_rounds = 0;
+                    entry.responded = true;
+                }
+                None if record.outcome == "transport" => {
+                    entry.failure_rounds = entry.failure_rounds.saturating_add(1);
+                    entry.responded = false;
+                }
+                None => {}
             }
         }
         let before = self.entries.len();
         self.entries.retain(|entry| {
-            if entry.connection_failures < 2 {
+            if entry.failure_rounds < 2 {
                 return true;
             }
             self.rejected
@@ -270,7 +280,7 @@ mod tests {
             &routes,
             1
         ));
-        assert_eq!(pool.entries[0].connection_failures, 1);
+        assert_eq!(pool.entries[0].failure_rounds, 1);
         assert!(!pool.observe_round(&[record(2, "proxy#1", None)], &routes, 2));
         assert!(pool.observe_round(&[record(3, "proxy#1", None)], &routes, 3));
         pool.replenish(all.clone(), 4);
@@ -280,17 +290,93 @@ mod tests {
         );
     }
     #[test]
-    fn http_541_resets_streak_and_does_not_evict() {
+    fn two_http_541_rounds_replace_only_the_failed_route() {
+        let mut pool = ProxyPool::default();
+        let all: Vec<_> = (1..=6).map(|n| candidate(n, 100.0)).collect();
+        pool.replenish(all.clone(), 0);
+        let routes = vec![("p".into(), all[0].url.clone())];
+        let first_round = [record(1, "p", Some(541)), record(2, "p", Some(541))];
+        assert!(!pool.observe_round(&first_round, &routes, 1));
+        assert_eq!(pool.entries[0].failure_rounds, 1);
+        assert!(pool.entries[0].responded);
+        // Replayed records and a local cooldown do not create another failure.
+        assert!(!pool.observe_round(&first_round, &routes, 2));
+        assert!(!pool.observe_round(&[], &routes, 3));
+        assert_eq!(pool.entries[0].failure_rounds, 1);
+        let retained = serde_json::to_value(&pool.entries[1..]).unwrap();
+        assert!(pool.observe_round(&[record(3, "p", Some(541))], &routes, 4));
+        pool.replenish(all.clone(), 5);
+        assert_eq!(pool.entries.len(), TARGET_SIZE);
+        assert_eq!(serde_json::to_value(&pool.entries[..4]).unwrap(), retained);
+        assert_eq!(pool.entries[4].url, all[5].url);
+        assert!(!pool.urls().contains(&all[0].url));
+    }
+    #[test]
+    fn transport_and_http_541_share_the_two_round_threshold() {
+        for statuses in [[None, Some(541)], [Some(541), None]] {
+            let mut pool = ProxyPool::default();
+            let c = candidate(1, 100.0);
+            pool.replenish(vec![c.clone()], 0);
+            let routes = vec![("p".into(), c.url)];
+            assert!(!pool.observe_round(&[record(1, "p", statuses[0])], &routes, 1));
+            assert_eq!(pool.entries[0].failure_rounds, 1);
+            assert!(pool.observe_round(&[record(2, "p", statuses[1])], &routes, 2));
+            assert!(pool.entries.is_empty());
+        }
+    }
+    #[test]
+    fn other_http_responses_reset_the_failure_streak() {
+        for status in [200, 403, 429, 500] {
+            let mut pool = ProxyPool::default();
+            let c = candidate(1, 100.0);
+            pool.replenish(vec![c.clone()], 0);
+            let routes = vec![("p".into(), c.url)];
+            pool.observe_round(&[record(1, "p", Some(541))], &routes, 1);
+            assert!(!pool.observe_round(&[record(2, "p", Some(status))], &routes, 2));
+            assert_eq!(pool.entries[0].failure_rounds, 0);
+            assert!(pool.entries[0].responded);
+            assert!(!pool.observe_round(&[record(3, "p", Some(541))], &routes, 3));
+            assert_eq!(pool.entries[0].failure_rounds, 1);
+        }
+    }
+    #[test]
+    fn last_actual_pickup_result_determines_each_round() {
         let mut pool = ProxyPool::default();
         let c = candidate(1, 100.0);
         pool.replenish(vec![c.clone()], 0);
         let routes = vec![("p".into(), c.url)];
-        pool.observe_round(&[record(1, "p", None)], &routes, 0);
-        pool.observe_round(&[record(2, "p", Some(541))], &routes, 1);
-        assert_eq!(pool.entries[0].connection_failures, 0);
-        assert!(pool.entries[0].responded);
-        pool.observe_round(&[], &routes, 2);
-        assert_eq!(pool.entries.len(), 1);
+        let recovered_round = [record(1, "p", Some(541)), record(2, "p", Some(200))];
+        assert!(!pool.observe_round(&recovered_round, &routes, 1));
+        assert_eq!(pool.entries[0].failure_rounds, 0);
+        let blocked_round = [record(3, "p", Some(200)), record(4, "p", Some(541))];
+        assert!(!pool.observe_round(&blocked_round, &routes, 2));
+        assert_eq!(pool.entries[0].failure_rounds, 1);
+        assert!(pool.observe_round(&[record(5, "p", Some(541))], &routes, 3));
+    }
+    #[test]
+    fn http_541_eviction_excludes_the_address_for_thirty_minutes() {
+        let mut pool = ProxyPool::default();
+        let c = candidate(1, 100.0);
+        pool.replenish(vec![c.clone()], 0);
+        let routes = vec![("p".into(), c.url.clone())];
+        pool.observe_round(&[record(1, "p", Some(541))], &routes, 1);
+        assert!(pool.observe_round(&[record(2, "p", Some(541))], &routes, 2));
+        pool.replenish(vec![c.clone()], 2 + REJECT_FOR_MS - 1);
+        assert!(pool.entries.is_empty());
+        pool.replenish(vec![c.clone()], 2 + REJECT_FOR_MS);
+        assert_eq!(pool.urls(), vec![c.url]);
+        assert_eq!(pool.entries[0].failure_rounds, 0);
+    }
+    #[test]
+    fn status_serializes_the_combined_failure_round_count() {
+        let mut pool = ProxyPool::default();
+        let c = candidate(1, 100.0);
+        pool.replenish(vec![c.clone()], 0);
+        pool.observe_round(&[record(1, "p", Some(541))], &[("p".into(), c.url)], 1);
+        let entry = serde_json::to_value(&pool.entries[0]).unwrap();
+        assert_eq!(entry["failureRounds"], 1);
+        assert_eq!(entry["responded"], true);
+        assert!(entry.get("connectionFailures").is_none());
     }
     #[test]
     fn warm_requests_and_direct_do_not_evict() {
@@ -304,7 +390,7 @@ mod tests {
             &[("p".into(), c.url)],
             1,
         );
-        assert_eq!(pool.entries[0].connection_failures, 0);
+        assert_eq!(pool.entries[0].failure_rounds, 0);
     }
     #[test]
     fn no_fabricated_fill_and_healthy_entries_stay() {

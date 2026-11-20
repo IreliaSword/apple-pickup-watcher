@@ -793,7 +793,7 @@ export default function App() {
                 <Switch id="auto-proxy-pool" checked={Boolean(ui.settings.autoProxyPoolEnabled)}
                   onCheckedChange={(enabled) => void saveSettings({ ...ui.settings, autoProxyPoolEnabled: enabled })} />
               </div>
-              <p className="text-muted-foreground text-xs">目标保持 5 个候选，不保证始终有 5 个可用。541 保留冷却；连续两轮实际连接失败才淘汰补位。免费代理不用于登录或下单。</p>
+              <p className="text-muted-foreground text-xs">目标保持 5 个候选，不保证始终有 5 个可用。连续两轮实际请求出现连接失败或 HTTP 541 才淘汰补位；本地冷却等待不计数。免费代理不用于登录或下单。</p>
               {ui.settings.autoProxyPoolEnabled ? (
                 <div className="grid gap-2">
                   <Label htmlFor="auto-proxy-source">候选来源</Label>
@@ -807,16 +807,16 @@ export default function App() {
                   <div className="flex items-center justify-between gap-2 text-sm">
                     <span>候选 {ui.proxyPool?.entries.length ?? 0} / 5 · {ui.proxyPool?.sourceState ?? "waiting"}</span>
                     <Button variant="outline" size="sm" disabled={ui.proxyPool?.sourceState === "fetching"}
-                      onClick={() => void refreshAutoProxyPool()}><RefreshCw /> 刷新来源</Button>
+                      onClick={() => void refreshAutoProxyPool()}><RefreshCw /> 更新订阅</Button>
                   </div>
                   <p role="status" className="text-muted-foreground text-xs">{ui.proxyPool?.message ?? "等待后台代理池状态；空池时不回退直连。"}</p>
                   {(ui.proxyPool?.entries ?? []).map((entry, index) => (
                     <div key={entry.url} className="grid gap-1">
                       <Input aria-label={`自动代理地址 ${index + 1}`} value={entry.url} readOnly />
-                      <span className="text-muted-foreground text-xs">{entry.source} · {entry.responded ? "收到过 HTTP 响应（不代表库存可查）" : "待验证"} · 连续连接失败 {entry.connectionFailures} 轮</span>
+                      <span className="text-muted-foreground text-xs">{entry.source} · {entry.responded ? "收到过 HTTP 响应（不代表库存可查）" : "待验证"} · 连续失败 {entry.failureRounds} 轮（连接失败 / HTTP 541）</span>
                     </div>
                   ))}
-                  <p className="text-muted-foreground text-xs">每 5 分钟刷新订阅；失效时先从缓存候选补位。网页遇安全验证会暂停自动获取，需人工处理。关闭自动池后恢复原手动代理。</p>
+                  <p className="text-muted-foreground text-xs">每 5 分钟更新订阅；只更新备用候选和补足空位，不强制更换已有代理。失效时先从缓存候选补位。网页遇安全验证会暂停自动获取，需人工处理。关闭自动池后恢复原手动代理。</p>
                 </div>
               ) : (
               <div className="grid gap-1.5">

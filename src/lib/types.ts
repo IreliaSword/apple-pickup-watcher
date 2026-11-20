@@ -247,5 +247,5 @@ export interface ProxyPoolStatus {
   message: string;
   targetSize: number;
   lastRefreshMs: number | null;
-  entries: { url: string; source: string; connectionFailures: number; responded: boolean }[];
+  entries: { url: string; source: string; failureRounds: number; responded: boolean }[];
 }

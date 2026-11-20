@@ -189,5 +189,5 @@ test("proxy pool refresh uses dedicated IPC and does not replace manual settings
   app.handlers.refresh_proxy_pool = () => { throw new Error("source rate limit"); };
   await app.refreshAutoProxyPool();
   assert.equal(app.snapshot().proxyPool, status);
-  assert.match(app.snapshot().logs.at(-1), /刷新代理来源失败/);
+  assert.match(app.snapshot().logs.at(-1), /更新代理订阅失败/);
 });

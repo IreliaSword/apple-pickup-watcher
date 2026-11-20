@@ -414,6 +414,6 @@ export async function refreshAutoProxyPool(): Promise<void> {
   try {
     update({ proxyPool: await invoke<ProxyPoolStatus>("refresh_proxy_pool") });
   } catch (err) {
-    pushLog(`刷新代理来源失败：${String(err)}`);
+    pushLog(`更新代理订阅失败：${String(err)}`);
   }
 }

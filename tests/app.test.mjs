@@ -6,6 +6,7 @@ function renderApp() {
   const saved = [];
   const addedTargets = [];
   const pushSaves = [];
+  const poolRefreshes = [];
   const state = {
     settings: { locale: "zh_CN", barkUrl: "https://api.day.app/saved-key", intervalSeconds: 30, targets: [] },
     stores: [], products: [], rows: [], regions: [], categories: [], logs: [],
@@ -27,6 +28,7 @@ function renderApp() {
     };
     if (specifier === "@/lib/store") return {
       watcherStore: { getSnapshot: () => state },
+      refreshAutoProxyPool: async () => { poolRefreshes.push(true); },
       saveSettings: async (settings) => { saved.push(settings); state.settings = settings; },
       setTargets: async (targets) => { addedTargets.push(targets); },
       setCategory: (category) => { state.category = category; },
@@ -92,6 +94,10 @@ function renderApp() {
     autoPool: () => control((element) => element?.props?.id === "auto-proxy-pool"),
     autoSource: () => control((element) => element?.props?.id === "auto-proxy-source"),
     autoRows: () => all((element) => /^自动代理地址 /.test(element?.props?.["aria-label"] ?? "")),
+    autoRefresh: () => control((element) => element.type === "Button" &&
+      Array.isArray(element.props.children) && element.props.children.includes(" 更新订阅")),
+    autoFailureLabels: () => all((element) => element.type === "span" &&
+      Array.isArray(element.props.children) && element.props.children.includes(" · 连续失败 ")),
     intervalInput: (edge) => control((element) => element?.props?.id === `interval-${edge}`),
     intervalGroup: () => control((element) => element?.type === "div" &&
       typeof element.props?.onBlur === "function"),
@@ -119,7 +125,7 @@ function renderApp() {
     status: () => control((element) => element.type === "p" &&
       typeof element.props.title === "string" && element.props.title.includes("个目标")).title,
     watchList: () => control((element) => element.type === "WatchList"),
-    state, saved, addedTargets, pushSaves,
+    state, saved, addedTargets, pushSaves, poolRefreshes,
   };
 }
 
@@ -452,7 +458,7 @@ test("automatic proxy mode retains manual addresses and renders only candidate r
   assert.equal(app.state.settings.autoProxyPoolEnabled, true);
   assert.deepEqual(app.state.settings.proxies, ["http://127.0.0.1:1080"]);
   assert.equal(app.proxyValues().length, 0);
-  app.state.proxyPool = { entries: [{ url: "http://8.8.8.8:8080", source: "fixture", connectionFailures: 0, responded: false }], sourceState: "ready", message: "unverified" };
+  app.state.proxyPool = { entries: [{ url: "http://8.8.8.8:8080", source: "fixture", failureRounds: 0, responded: false }], sourceState: "ready", message: "unverified" };
   assert.equal(app.autoRows().length, 1);
   assert.equal(app.autoRows()[0].props.readOnly, true);
   app.autoSource().onChange({ target: { value: "proxy5Browser" } });
@@ -461,4 +467,22 @@ test("automatic proxy mode retains manual addresses and renders only candidate r
   app.autoPool().onCheckedChange(false);
   await new Promise(setImmediate);
   assert.deepEqual(app.proxyValues(), ["http://127.0.0.1:1080"]);
+});
+
+test("update subscription button keeps refresh action and displays combined failure rounds", async () => {
+  const app = renderApp();
+  app.state.settings.autoProxyPoolEnabled = true;
+  app.state.proxyPool = {
+    entries: [{ url: "http://8.8.8.8:8080", source: "fixture", failureRounds: 1, responded: true }],
+    sourceState: "ready", message: "unverified",
+  };
+  assert.equal(app.autoRefresh().disabled, false);
+  await app.autoRefresh().onClick();
+  assert.equal(app.poolRefreshes.length, 1);
+  const failureLabel = app.autoFailureLabels()[0].props.children;
+  assert.ok(failureLabel.includes(1));
+  assert.ok(failureLabel.includes(" 轮（连接失败 / HTTP 541）"));
+  assert.ok(failureLabel.some((text) => typeof text === "string" && text.includes("收到过 HTTP 响应")));
+  app.state.proxyPool.sourceState = "fetching";
+  assert.equal(app.autoRefresh().disabled, true);
 });
